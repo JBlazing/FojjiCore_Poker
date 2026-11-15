@@ -1,0 +1,13 @@
+## Interface: 16001
+## AllowLoadGameType: camelot
+## Title: |cff66b3ffFojji|r|cffff4444Core|r: Poker
+## Notes: Heads-up No-Limit Hold'em and Pot-Limit Omaha against a friend, in the FojjiCore games menu.
+## Version: 1.0.0
+## Dependencies: FojjiCore, FojjiCore_Games
+## Group: FojjiCore
+## SavedVariables: FojjiCorePokerDB
+## IconTexture: Interface\AddOns\FojjiCore\textures\FojjiIcons\F_icon_lightblue.png
+
+Eval.lua
+Engine.lua
+Poker.lua
