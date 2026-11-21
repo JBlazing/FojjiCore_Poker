@@ -40,6 +40,17 @@ eq(Eval.Name(five("Ac Ad Qh Qs Kc")), "Two pair, Aces and Queens", "two pair nam
 eq(Eval.Name(five("9c 9d Ah Qs Kc")), "Pair of Nines", "pair name")
 eq(Eval.Name(five("Ac Jd 8h 4s 2c")), "Ace high", "high card name")
 
+-- the hand you hold right now, street by street
+eq(Eval.Current(cards("Kc 7d"), {}), "King high", "preflop high card")
+eq(Eval.Current(cards("7c 7d"), {}), "Pair of Sevens", "preflop pair")
+eq(Eval.Current(cards("Kc 7d"), cards("Kh 7s 2c")), "Two pair, Kings and Sevens", "flop two pair")
+eq(Eval.Current(cards("Kc 7d"), cards("Kh 7s 2c 7h")), "Full house, Sevens over Kings", "turn boat")
+eq(Eval.Current(cards("Ah Kh 2c 3d"), {}, true), "Ace high", "omaha preflop high")
+eq(Eval.Current(cards("9h 9d 2c 2d"), {}, true), "Pair of Nines", "omaha preflop pair")
+eq(Eval.Current(cards("Ah Kd 2c 3d"), cards("Qh Jh Th"), true), "Straight, Ace high", "omaha uses two hole cards")
+eq(Eval.Current(cards("Ah 4c 5c 6c"), cards("Kh Qh Jh"), true), "Ace high", "omaha needs two hole cards for a flush")
+eq(Eval.Current({}, {}), "", "no cards yet")
+
 -- every one of the 2,598,960 five-card hands gets a category with the right frequency
 do
     local count = {}

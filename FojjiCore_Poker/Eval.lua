@@ -148,6 +148,28 @@ function Eval.Name(score)
     return ("%s high"):format(ONE[a])
 end
 
+-- What a player holds right now, by name, for any street. Before the flop only the hole cards count,
+-- so the answer is a pair or a high card (in Omaha, the best two of the four).
+function Eval.Current(hole, board, omaha)
+    if type(hole) ~= "table" or #hole < 2 then return "" end
+    board = board or {}
+    if #board >= 3 then
+        local sc = (omaha and Eval.Omaha or Eval.Holdem)(hole, board)
+        return sc and Eval.Name(sc) or ""
+    end
+    local high, pair, seen = 0, 0, {}
+    for _, c in ipairs(hole) do
+        local x = VALUE[c]
+        if x then
+            if seen[x] and x > pair then pair = x end
+            seen[x] = true
+            if x > high then high = x end
+        end
+    end
+    if pair > 0 then return ("Pair of %s"):format(MANY[pair]) end
+    return high > 0 and ("%s high"):format(ONE[high]) or ""
+end
+
 -- "As", "Td", "9c": handy for tests and for the hand history
 local RCH = { "A", "2", "3", "4", "5", "6", "7", "8", "9", "T", "J", "Q", "K" }
 local SCH = { "h", "d", "s", "c" }

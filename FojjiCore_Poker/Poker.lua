@@ -810,6 +810,10 @@ local function build()
         f.plates[side] = p
         f.bets[side] = newBet(t)
     end
+    -- your hand so far ("Two pair, Kings and Sevens"), beside your cards while a hand is being bet
+    f.myHand = Kit.Text(t, 12, GOLD, "LEFT")
+    f.myHand:SetPoint("LEFT", f.cards[2].row, "RIGHT", 14, 0)
+    f.myHand:SetWidth(150)
     f.bets[1]:SetPoint("TOP", f.cards[1].row, "BOTTOM", -40, -10)
     f.bets[2]:SetPoint("BOTTOM", f.cards[2].row, "TOP", -40, 10)
 
@@ -888,6 +892,7 @@ paint = function()
         f.status:SetText("")
         f.handInfo:SetText("")
         f.gameInfo:SetText("")
+        f.myHand:SetText("")
         f.bar:Hide()
         return
     end
@@ -963,6 +968,14 @@ paint = function()
         local sc = ev(view.holes[seat], board)
         return sc and Eval.Name(sc) or "All-in"
     end
+    -- your own hand while the betting is on (the runout and showdown name hands on the plates)
+    local mine = ""
+    if not showingLast and not rolling and h.phase == "bet" and h.holes and h.holes[me] then
+        local board = {}
+        for i = 1, shown do board[i] = h.board[i] end
+        mine = Eval.Current(h.holes[me], board, match.opts.variant == "PLO")
+    end
+    f.myHand:SetText(mine)
 
     -- plates, bets and what each player last did
     local stacks = showingLast and view.endStacks or match.stacks
