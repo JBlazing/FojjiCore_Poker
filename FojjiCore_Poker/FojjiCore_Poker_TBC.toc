@@ -1,6 +1,6 @@
 ## Interface: 20506
 ## Title: |cff66b3ffFojji|r|cffff4444Core|r: Poker
-## Notes: Heads-up No-Limit Hold'em and Pot-Limit Omaha against a friend, in the FojjiCore games menu.
+## Notes: No-Limit Hold'em and Pot-Limit Omaha for 2 to 9 friends, in the FojjiCore games menu.
 ## Version: 1.0.0
 ## Dependencies: FojjiCore, FojjiCore_Games
 ## Group: FojjiCore
@@ -9,4 +9,5 @@
 
 Eval.lua
 Engine.lua
+Table.lua
 Poker.lua

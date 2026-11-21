@@ -3,7 +3,8 @@
 --
 --   local Mock = dofile("tests/wow_mock.lua")
 --   local world = Mock.World()
---   local a = world:Client("Alice", { "Bob" })   -- name, the people it can see (party/guild)
+--   local a = world:Client("Alice", { "Bob" })   -- name, the people it can see (guild, and party)
+--   world:Client("Alice", { "Bob" }, nil, {})    -- the same, but in no party (whispers only)
 --   world:Run(seconds)                           -- runs timers and delivers whispers
 --
 -- Widget methods: anything starting with a capital letter that isn't modelled is a no-op, so the
@@ -12,7 +13,7 @@ local Mock = {}
 
 local GAMES = (os.getenv("FOJJI_ADDONS") or "D:/Games/World of Warcraft/_forever_/Interface/AddOns") .. "/"
 local GAMES_FILES = { "Base/Init.lua", "Base/Kit.lua", "Base/Comm.lua", "Games.lua", "GamesUI.lua", "Duel.lua", "Scores.lua" }
-local OUR_FILES = { "Eval.lua", "Engine.lua", "Poker.lua" }
+local OUR_FILES = { "Eval.lua", "Engine.lua", "Table.lua", "Poker.lua" }
 Mock.GAMES = GAMES
 
 local function noop() end
@@ -138,17 +139,20 @@ function Mock.World()
         for _, c in ipairs(self.clients) do if c.name == name and not c.dead then return c end end
     end
 
-    -- name: this player; friends: names it shares a guild/party with; saved: SavedVariables to load
-    function world:Client(name, friends, saved)
+    -- name: this player; friends: names it shares a guild with; saved: SavedVariables to load;
+    -- party: names it's grouped with (defaults to everyone in friends)
+    function world:Client(name, friends, saved, party)
         local client = { name = name, world = world, printed = {}, reports = {} }
         local env = setmetatable({}, { __index = _G })
         env._G = env
         client.env = env
         friends = friends or {}
+        party = party or friends
+        client.party = party
         local function isFriend(n)
             if type(n) ~= "string" then return false end
             n = n:gsub("%-.*$", "")
-            for _, f in ipairs(friends) do if f == n then return true end end
+            for _, f in ipairs(party) do if f == n then return true end end
             return false
         end
 
@@ -194,7 +198,7 @@ function Mock.World()
         env.UnitClass = function() return "Warlock", "WARLOCK" end
         env.UnitInParty = function(n) return isFriend(n) end
         env.UnitInRaid = function() return nil end
-        env.IsInGroup = function() return #friends > 0 end
+        env.IsInGroup = function() return #party > 0 end
         env.IsInRaid = function() return false end
         env.IsInGuild = function() return true end
         env.GetNumGuildMembers = function() return #friends + 1 end
@@ -229,8 +233,17 @@ function Mock.World()
             if world.drop > 0 and math.random() < world.drop then world.dropped = world.dropped + 1 return true end
             local to = target and target:gsub("%-.*$", "")
             world:After(0.12, function()
-                local other = world:Find(to)
-                if other then other.FDJ:Emit("FDJ_COMM", kind, payload, name, channel) end
+                if to then
+                    local other = world:Find(to)
+                    if other then other.FDJ:Emit("FDJ_COMM", kind, payload, name, channel) end
+                    return
+                end
+                -- a group message: everyone in this client's party hears it
+                for _, other in ipairs(world.clients) do
+                    if not other.dead and other.name ~= name and isFriend(other.name) then
+                        other.FDJ:Emit("FDJ_COMM", kind, payload, name, channel or "PARTY")
+                    end
+                end
             end)
             return true
         end

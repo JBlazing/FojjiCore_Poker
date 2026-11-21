@@ -44,7 +44,7 @@ for toc in "$ADDON_DIR"/*.toc; do
 done
 
 echo "== Engine tests =="
-# tests/test_duel.lua needs FojjiCore Games installed, so only the pure engine tests run here.
+# tests/test_table.lua needs FojjiCore Games installed, so only the pure engine tests run here.
 if ! lua5.1 tests/test_engine.lua; then
   fail=1
 fi

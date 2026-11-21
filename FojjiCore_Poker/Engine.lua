@@ -1,30 +1,35 @@
--- The rules of a heads-up match: blinds, betting, the deal and the showdown. Pure Lua with no game
--- client calls, so the tests run it outside WoW.
+-- The rules of a poker table for 2 to 9 players: blinds, betting, side pots, the deal and the
+-- showdown. Pure Lua with no game client calls, so the tests run it outside WoW.
 --
--- Both players run this same engine on the same messages in the same order, so both always agree on
--- the state. Seats: 1 is the player who moved first in the duel session, 2 the other. The button
--- (who is also the small blind) is seat 1 on odd hands and seat 2 on even hands.
+-- Every player runs this same engine on the same messages in the same order (the host puts them in
+-- order, see Table.lua), so everyone always agrees on the state. Seats are 1..N in the order the host
+-- seated everyone. The button starts on seat 1 and moves to the next player with chips each hand.
+-- With three or more players the two seats after the button post the blinds and the seat after the
+-- big blind acts first. Heads-up (two players left), the button posts the small blind and acts first
+-- before the flop and last after it.
 --
--- Messages (each one is a duel move, sent by whoever Engine.Expect says):
+-- Messages (each one is a move, sent by whoever Engine.Expect says):
 --   K<hex>   the big blind commits to a secret        (phase "commit")
 --   S<n>     the button answers with its own number   (phase "seed")
 --   R<text>  the big blind reveals the secret: the deck is now shuffled from both
 --   Z        the big blind lost its secret (a crash): commit again
 --   F  X  C  B<to>   fold, check, call, bet or raise to <to> (this street's total)
+--   O<seat>  (from seat 0, the host) that player left the table: they fold, and their chips leave too
 --
--- The shuffle can't be steered by either player: the secret is fixed (committed) before the other
+-- The shuffle can't be steered by either dealer: the secret is fixed (committed) before the other
 -- number is known, and the other number is chosen without knowing the secret. It is not a hidden
--- deck: once the secret is revealed both clients could work out every card. The addon only ever
--- shows your own cards, plus the other player's at a showdown. Play chips only.
+-- deck: once the secret is revealed every client could work out every card. The addon only ever
+-- shows your own cards, plus the others' at a showdown. Play chips only.
 local _, ns = ...
 ns = ns or {}
 local Engine = {}
 ns.Engine = Engine
 local Eval = ns.Eval
 
-local floor, min, max, abs = math.floor, math.min, math.max, math.abs
+local floor, min, max = math.floor, math.min, math.max
 
 Engine.UNIT = 20 -- the first big blind; stacks are counted in these
+Engine.MAX_SEATS = 9
 local LEVELS = { 20, 30, 40, 60, 80, 100, 150, 200, 300, 400, 600, 800, 1000, 1500, 2000, 3000, 4000,
     6000, 8000, 10000, 15000, 20000, 30000, 40000, 60000, 80000, 100000 }
 Engine.VARIANTS = { NL = "No-Limit Hold'em", PLO = "Pot-Limit Omaha" }
@@ -95,6 +100,48 @@ local function deckFor(m, h)
     return Engine.Shuffle(a * 7 + b)
 end
 
+-- ---------------------------------------------------------------- seats
+local function copy(t, n)
+    local c = {}
+    for i = 1, n do c[i] = t[i] end
+    return c
+end
+-- the first seat after `from` (going round the table, `from` itself last) that passes ok(i)
+local function after(m, from, ok)
+    local N = m.seats
+    for d = 1, N do
+        local i = (from - 1 + d) % N + 1
+        if ok(i) then return i end
+    end
+    return nil
+end
+-- the same, but `from` itself first
+local function atOrAfter(m, from, ok)
+    return after(m, (from - 2) % m.seats + 1, ok)
+end
+Engine.After = after
+
+-- in the hand and not folded
+local function live(h, i) return h.inHand[i] and not h.folded[i] end
+-- still able to bet: in the hand, not folded, chips behind
+local function canAct(m, h, i) return live(h, i) and m.stacks[i] > 0 end
+local function highBet(m, h)
+    local hi = 0
+    for i = 1, m.seats do if h.bet[i] > hi then hi = h.bet[i] end end
+    return hi
+end
+local function sumBets(m, h)
+    local s = 0
+    for i = 1, m.seats do s = s + h.bet[i] end
+    return s
+end
+local function countLive(m, h)
+    local n, last = 0, nil
+    for i = 1, m.seats do if live(h, i) then n, last = n + 1, i end end
+    return n, last
+end
+Engine.Live = live
+
 -- ---------------------------------------------------------------- the match
 local function post(m, h, seat, amount)
     local a = min(amount, m.stacks[seat])
@@ -104,24 +151,56 @@ local function post(m, h, seat, amount)
     return a
 end
 
-function Engine.StartHand(m, n, s1, s2)
-    m.stacks = { s1, s2 }
+-- who runs the deal: the big blind commits, the button answers (the next players along stand in for
+-- anyone who has left the table)
+local function pickDealers(m, h)
+    local function here(i) return h.inHand[i] and not m.out[i] end
+    h.committer = atOrAfter(m, h.bbSeat, here)
+    h.answerer = h.committer and atOrAfter(m, h.button, function(i) return here(i) and i ~= h.committer end)
+end
+
+-- out[i]: nil while seat i is playing, "bust" or "left" once it isn't; place[i]: where it finished
+function Engine.StartHand(m, n, stacks, button, out, place)
+    local N = m.seats
+    m.stacks = copy(stacks, N)
+    m.out = copy(out or {}, N)
+    m.place = copy(place or {}, N)
     local sb, bb = Engine.Blinds(m.opts, n)
-    local btn = (n - 1) % 2 + 1
-    local h = { n = n, button = btn, sb = sb, bb = bb, phase = "commit", log = {}, startStacks = { s1, s2 },
-        bet = { 0, 0 }, total = { 0, 0 }, pot = 0, acted = { false, false }, street = 0, lastRaise = bb,
-        holes = { {}, {} }, board = {}, said = {} }
+    local h = { n = n, button = button, sb = sb, bb = bb, phase = "commit", log = {},
+        startStacks = copy(stacks, N), startOut = copy(m.out, N), startPlace = copy(m.place, N),
+        bet = {}, total = {}, acted = {}, actedAt = {}, folded = {}, inHand = {}, holes = {}, said = {},
+        pot = 0, street = 0, lastRaise = bb, raises = 0, board = {} }
+    local players = 0
+    for i = 1, N do
+        h.bet[i], h.total[i], h.acted[i], h.actedAt[i], h.holes[i] = 0, 0, false, 0, {}
+        h.inHand[i] = not m.out[i]
+        h.folded[i] = false
+        if h.inHand[i] then players = players + 1 end
+    end
+    h.players = players
+    local function inHand(i) return h.inHand[i] end
+    if players == 2 then
+        h.sbSeat = button
+        h.bbSeat = after(m, button, inHand)
+    else
+        h.sbSeat = after(m, button, inHand)
+        h.bbSeat = after(m, h.sbSeat, inHand)
+    end
     m.hand = h
-    post(m, h, btn, sb)
-    post(m, h, 3 - btn, bb)
+    post(m, h, h.sbSeat, sb)
+    post(m, h, h.bbSeat, bb)
+    pickDealers(m, h)
     return h
 end
 
-function Engine.NewMatch(optsText, salt)
+function Engine.NewMatch(optsText, salt, seats)
     local o = Engine.ParseOpts(optsText)
+    seats = max(2, min(Engine.MAX_SEATS, floor(tonumber(seats) or 2)))
     local start = o.stackBB * Engine.UNIT
-    local m = { opts = o, optsText = Engine.OptsText(o), salt = tostring(salt or ""), start = start }
-    Engine.StartHand(m, 1, start, start)
+    local m = { opts = o, optsText = Engine.OptsText(o), salt = tostring(salt or ""), start = start, seats = seats, burned = 0 }
+    local stacks = {}
+    for i = 1, seats do stacks[i] = start end
+    Engine.StartHand(m, 1, stacks, 1, {}, {})
     return m
 end
 
@@ -130,90 +209,207 @@ function Engine.BoardShown(h)
     if h.result and h.result.showdown then return 5 end
     return ({ [0] = 0, 3, 4, 5 })[h.street] or 0
 end
+-- every chip at the table: stacks, bets and the pot (and nothing a leaver took away)
+function Engine.Chips(m)
+    local s = 0
+    for i = 1, m.seats do s = s + m.stacks[i] end
+    local h = m.hand
+    if not m.over and h and h.phase ~= "done" then s = s + h.pot + sumBets(m, h) end
+    return s
+end
+function Engine.Pot(m, h)
+    h = h or m.hand
+    return h.pot + sumBets(m, h)
+end
+function Engine.HighBet(m, h) return highBet(m, h or m.hand) end
 
 -- who must send the next message, and what kind: "K" "S" "R" (the deal) or "A" (a betting action)
 function Engine.Expect(m)
     if m.over then return nil end
     local h = m.hand
-    if h.phase == "commit" then return 3 - h.button, "K" end
-    if h.phase == "seed" then return h.button, "S" end
-    if h.phase == "reveal" then return 3 - h.button, "R" end
+    if h.phase == "commit" then return h.committer, "K" end
+    if h.phase == "seed" then return h.answerer, "S" end
+    if h.phase == "reveal" then return h.committer, "R" end
     if h.phase == "bet" and h.toAct then return h.toAct, "A" end
     return nil
 end
 
 -- does this seat still have to act on this street
 local function needs(m, h, i)
-    local o = 3 - i
-    if m.stacks[i] == 0 then return false end
-    if h.bet[i] < h.bet[o] then return true end
-    return not h.acted[i] and m.stacks[o] > 0
+    if not canAct(m, h, i) then return false end
+    if h.bet[i] < highBet(m, h) then return true end
+    if h.acted[i] then return false end
+    -- hasn't acted yet: only worth it if someone else could still answer a bet
+    for j = 1, m.seats do
+        if j ~= i and canAct(m, h, j) then return true end
+    end
+    return false
 end
 
 local function finishHand(m, h, result)
+    local N = m.seats
     h.phase, h.result, h.toAct = "done", result, nil
-    h.endStacks = { m.stacks[1], m.stacks[2] }
+    h.endStacks = copy(m.stacks, N)
     m.last = h
-    if m.stacks[1] == 0 or m.stacks[2] == 0 then
+    -- who is out after this hand: the best place goes to whoever started it with more chips
+    local gone = {}
+    for i = 1, N do
+        if not m.out[i] and m.stacks[i] == 0 then gone[#gone + 1] = i end
+    end
+    local alive = 0
+    for i = 1, N do if not m.out[i] and m.stacks[i] > 0 then alive = alive + 1 end end
+    table.sort(gone, function(a, b)
+        -- leaving places below going bust, and leaving later places above leaving earlier
+        local la, lb = h.left and h.left[a], h.left and h.left[b]
+        if (la ~= nil) ~= (lb ~= nil) then return lb ~= nil end
+        if la and lb then return la > lb end
+        if h.startStacks[a] ~= h.startStacks[b] then return h.startStacks[a] > h.startStacks[b] end
+        return a < b
+    end)
+    for k, i in ipairs(gone) do
+        m.place[i] = alive + k
+        m.out[i] = (h.left and h.left[i]) and "left" or "bust"
+    end
+    if alive <= 1 then
         m.over = true
-        m.winner = m.stacks[1] > 0 and 1 or 2
+        for i = 1, N do
+            if not m.out[i] then m.winner, m.place[i] = i, 1 end
+        end
         m.hand = h
         return
     end
-    Engine.StartHand(m, h.n + 1, m.stacks[1], m.stacks[2])
+    local btn = after(m, h.button, function(i) return not m.out[i] end)
+    Engine.StartHand(m, h.n + 1, m.stacks, btn, m.out, m.place)
+end
+
+-- everyone else folded (or left): the last one standing takes every chip in the middle
+local function winByFold(m, h, folder)
+    local _, w = countLive(m, h)
+    h.pot = h.pot + sumBets(m, h)
+    for i = 1, m.seats do h.bet[i] = 0 end
+    h.toAct = nil
+    local won = {}
+    for i = 1, m.seats do won[i] = 0 end
+    if w then
+        m.stacks[w] = m.stacks[w] + h.pot
+        won[w] = h.pot
+    else
+        m.burned = m.burned + h.pot
+    end
+    finishHand(m, h, { winner = w or 0, won = won, pot = h.pot, fold = folder,
+        pots = { { amount = h.pot, winners = { w } } } })
+end
+
+-- seats in the order chips are handed out: left of the button first
+local function fromButton(m, h, set)
+    local list = {}
+    for d = 1, m.seats do
+        local i = (h.button - 1 + d) % m.seats + 1
+        if set[i] then list[#list + 1] = i end
+    end
+    return list
 end
 
 local function showdown(m, h)
+    local N = m.seats
     local ev = m.opts.variant == "PLO" and Eval.Omaha or Eval.Holdem
     local board = {}
     for i = 1, 5 do board[i] = h.board[i] end
-    local s1, b1 = ev(h.holes[1], board)
-    local s2, b2 = ev(h.holes[2], board)
-    local won = { 0, 0 }
-    local winner
-    if s1 > s2 then winner = 1 elseif s2 > s1 then winner = 2 else winner = 0 end
-    if winner == 0 then
-        local half = floor(h.pot / 2)
-        won[1], won[2] = half, half
-        -- the odd chip goes to the player out of position (the big blind)
-        won[3 - h.button] = won[3 - h.button] + (h.pot - 2 * half)
-    else
-        won[winner] = h.pot
+    local scores, best, names = {}, {}, {}
+    local levels, seen = {}, {}
+    for i = 1, N do
+        if live(h, i) then
+            scores[i], best[i] = ev(h.holes[i], board)
+            names[i] = Eval.Name(scores[i])
+            local c = h.total[i]
+            if c > 0 and not seen[c] then seen[c], levels[#levels + 1] = true, c end
+        end
     end
-    m.stacks[1], m.stacks[2] = m.stacks[1] + won[1], m.stacks[2] + won[2]
-    finishHand(m, h, { winner = winner, won = won, pot = h.pot, showdown = true, allin = h.allin, runFrom = h.runFrom,
-        scores = { s1, s2 }, best = { b1, b2 }, names = { Eval.Name(s1), Eval.Name(s2) } })
+    table.sort(levels)
+    local won = {}
+    for i = 1, N do won[i] = 0 end
+    -- one pot per all-in level: the main pot first, then the side pots
+    local pots, prev = {}, 0
+    for k, v in ipairs(levels) do
+        local amount = 0
+        for i = 1, N do
+            local c = h.total[i]
+            local top = k == #levels and c or min(c, v) -- the last pot takes anything left over
+            amount = amount + max(0, top - min(c, prev))
+        end
+        local top, winners = nil, {}
+        for i = 1, N do
+            if live(h, i) and h.total[i] >= v then
+                if not top or scores[i] > top then top, winners = scores[i], { [i] = true }
+                elseif scores[i] == top then winners[i] = true end
+            end
+        end
+        local order = fromButton(m, h, winners)
+        if amount > 0 and #order > 0 then
+            local share = floor(amount / #order)
+            local odd = amount - share * #order
+            for j, i in ipairs(order) do
+                -- the odd chips go one each to the winners nearest the button's left
+                won[i] = won[i] + share + (j <= odd and 1 or 0)
+            end
+            local p = pots[#pots]
+            -- a pot with the same winners as the one before it is the same pot as far as anyone can see
+            if p and table.concat(p.winners, ",") == table.concat(order, ",") then
+                p.amount = p.amount + amount
+            else
+                pots[#pots + 1] = { amount = amount, winners = order }
+            end
+        end
+        prev = v
+    end
+    local total = 0
+    for i = 1, N do
+        m.stacks[i] = m.stacks[i] + won[i]
+        total = total + won[i]
+    end
+    local main = pots[1] and pots[1].winners or {}
+    finishHand(m, h, { winner = #main == 1 and main[1] or 0, won = won, pot = total, pots = pots, showdown = true,
+        allin = h.allin, runFrom = h.runFrom, scores = scores, best = best, names = names })
 end
 
 local begin
 local function endStreet(m, h)
+    local N = m.seats
     h.toAct = nil
-    local b1, b2 = h.bet[1], h.bet[2]
-    if b1 ~= b2 then
-        -- the part of a bet the all-in player couldn't match goes back
-        local hi = b1 > b2 and 1 or 2
-        local d = abs(b1 - b2)
-        m.stacks[hi] = m.stacks[hi] + d
-        h.bet[hi], h.total[hi] = h.bet[hi] - d, h.total[hi] - d
-        h.refund = { seat = hi, amount = d }
+    -- the part of a bet nobody could match goes back
+    local top, topSeat, second = -1, nil, 0
+    for i = 1, N do
+        local b = h.bet[i]
+        if b > top then top, topSeat, second = b, i, max(second, top)
+        elseif b > second then second = b end
     end
-    h.pot = h.pot + h.bet[1] + h.bet[2]
-    h.bet = { 0, 0 }
+    if topSeat and top > second then
+        local d = top - second
+        m.stacks[topSeat] = m.stacks[topSeat] + d
+        h.bet[topSeat], h.total[topSeat] = h.bet[topSeat] - d, h.total[topSeat] - d
+        h.refund = { seat = topSeat, amount = d }
+    end
+    h.pot = h.pot + sumBets(m, h)
+    for i = 1, N do h.bet[i] = 0 end
     if h.street == 3 then return showdown(m, h) end
-    if m.stacks[1] == 0 or m.stacks[2] == 0 then
+    local able = 0
+    for i = 1, N do if canAct(m, h, i) then able = able + 1 end end
+    if able <= 1 then
         -- how much of the board was out when the betting stopped (the window deals the rest slowly)
         h.runFrom = Engine.BoardShown(h)
         h.street, h.allin = 3, true
         return showdown(m, h)
     end
     h.street = h.street + 1
-    h.acted, h.lastRaise, h.said = { false, false }, h.bb, {}
-    begin(m, h, 3 - h.button)
+    h.lastRaise, h.raises, h.said = h.bb, 0, {}
+    for i = 1, N do h.acted[i], h.actedAt[i] = false, 0 end
+    begin(m, h, h.button)
 end
-begin = function(m, h, first)
-    if needs(m, h, first) then h.toAct = first
-    elseif needs(m, h, 3 - first) then h.toAct = 3 - first
-    else endStreet(m, h) end
+-- the first seat after `from` that has to act, or the end of the street
+begin = function(m, h, from)
+    if countLive(m, h) <= 1 then return winByFold(m, h, h.last and h.last.seat) end
+    local i = after(m, from, function(s) return needs(m, h, s) end)
+    if i then h.toAct = i else endStreet(m, h) end
 end
 
 -- What the player to act may do:
@@ -224,16 +420,22 @@ function Engine.Legal(m)
     local h = m.hand
     if h.phase ~= "bet" or not h.toAct then return nil end
     local i = h.toAct
-    local o = 3 - i
     local st = m.stacks
-    local toCall = max(0, h.bet[o] - h.bet[i])
+    local high = highBet(m, h)
+    local toCall = max(0, high - h.bet[i])
     local L = { seat = i, toCall = toCall, fold = toCall > 0, check = toCall == 0,
         call = toCall > 0 and min(toCall, st[i]) or nil, allinTo = h.bet[i] + st[i] }
-    if st[o] > 0 and st[i] > toCall then
-        local high = max(h.bet[1], h.bet[2])
-        local maxTo = min(h.bet[i] + st[i], h.bet[o] + st[o])
+    -- the most anyone else could still put in on this street: no point betting past that
+    local others = nil
+    for j = 1, m.seats do
+        if j ~= i and canAct(m, h, j) then others = max(others or 0, h.bet[j] + st[j]) end
+    end
+    -- a raise all-in for less than a full raise doesn't let those who already acted raise again
+    local open = not h.acted[i] or h.actedAt[i] < h.raises
+    if others and open and st[i] > toCall then
+        local maxTo = min(h.bet[i] + st[i], others)
         if m.opts.variant == "PLO" then
-            maxTo = min(maxTo, high + h.pot + h.bet[1] + h.bet[2] + toCall)
+            maxTo = min(maxTo, high + h.pot + sumBets(m, h) + toCall)
         end
         if maxTo > high then
             L.minTo, L.maxTo = min(high + h.lastRaise, maxTo), maxTo
@@ -246,18 +448,11 @@ end
 local function bettingAction(m, h, seat, msg)
     local L = Engine.Legal(m)
     if not L or L.seat ~= seat then return false, "not your turn" end
-    local o = 3 - seat
     local kind = msg:sub(1, 1)
     if kind == "F" then
         if not L.fold then return false, "nothing to fold to" end
+        h.folded[seat] = true
         h.said[seat] = { "fold" }
-        h.pot = h.pot + h.bet[1] + h.bet[2]
-        h.bet = { 0, 0 }
-        m.stacks[o] = m.stacks[o] + h.pot
-        local won = { 0, 0 }
-        won[o] = h.pot
-        finishHand(m, h, { winner = o, won = won, pot = h.pot, fold = seat })
-        return true
     elseif kind == "X" then
         if not L.check then return false, "can't check" end
         h.said[seat] = { "check" }
@@ -268,29 +463,76 @@ local function bettingAction(m, h, seat, msg)
     elseif kind == "B" then
         local to = tonumber(msg:match("^B(%d+)$"))
         if not (to and L.minTo and to >= L.minTo and to <= L.maxTo) then return false, "bad amount" end
-        local high = max(h.bet[1], h.bet[2])
+        local high = highBet(m, h)
         post(m, h, seat, to - h.bet[seat])
-        if to - high >= h.lastRaise then h.lastRaise = to - high end
+        if to - high >= h.lastRaise then
+            h.lastRaise = to - high
+            h.raises = h.raises + 1
+        end
         h.said[seat] = { L.bet and "bet" or "raise", to, allin = m.stacks[seat] == 0 }
     else
         return false, "unknown action"
     end
     h.acted[seat] = true
+    h.actedAt[seat] = h.raises
     h.last = { seat = seat, kind = kind }
-    if needs(m, h, o) then h.toAct = o
-    elseif needs(m, h, seat) then h.toAct = seat
-    else endStreet(m, h) end
+    begin(m, h, seat)
     return true
 end
 
--- Applies one message from a seat. Returns true, or false and why (the state is then unchanged).
+-- a player left the table (or the host removed them): they fold, and the chips in front of them go
+-- with them; anything they already put in stays in the pot
+local function leave(m, h, s)
+    if not (s and s >= 1 and s <= m.seats) or m.out[s] or (h.left and h.left[s]) then return false, "not at the table" end
+    h.left = h.left or {}
+    local order = 0
+    for _ in pairs(h.left) do order = order + 1 end
+    h.left[s] = order + 1
+    m.burned = m.burned + m.stacks[s]
+    m.stacks[s] = 0
+    local wasLive = live(h, s)
+    if wasLive then
+        h.folded[s] = true
+        h.said[s] = { "left" }
+    end
+    if h.phase == "bet" then
+        if countLive(m, h) <= 1 then
+            winByFold(m, h, s)
+        elseif h.toAct == s or not (h.toAct and needs(m, h, h.toAct)) then
+            begin(m, h, h.toAct or s)
+        end
+    else
+        -- before the cards are out: the deal goes on with whoever is still here
+        if countLive(m, h) <= 1 then
+            winByFold(m, h, s)
+        elseif s == h.committer or s == h.answerer then
+            h.commit, h.seedB, h.phase = nil, nil, "commit"
+            local keep = m.out[s]
+            m.out[s] = "left" -- only for picking the dealers
+            pickDealers(m, h)
+            m.out[s] = keep
+        end
+    end
+    return true
+end
+
+-- Applies one message from a seat (0 for the host's own messages). Returns true, or false and why
+-- (the state is then unchanged).
 function Engine.Apply(m, seat, msg)
     if m.over then return false, "match over" end
     msg = tostring(msg or "")
-    local wantSeat, wantKind = Engine.Expect(m)
-    if seat ~= wantSeat then return false, "out of turn" end
     local h = m.hand
     local kind = msg:sub(1, 1)
+    if seat == 0 then
+        local s = tonumber(msg:match("^O(%d)$"))
+        if not s then return false, "unknown table message" end
+        local ok, err = leave(m, h, s)
+        if not ok then return false, err end
+        h.log[#h.log + 1] = msg
+        return true
+    end
+    local wantSeat, wantKind = Engine.Expect(m)
+    if seat ~= wantSeat then return false, "out of turn" end
     if wantKind == "K" then
         local c = msg:match("^K(%x+)$")
         if not c or #c ~= 16 then return false, "bad commit" end
@@ -312,13 +554,18 @@ function Engine.Apply(m, seat, msg)
             h.secret = secret
             local deck = deckFor(m, h)
             local k = Engine.Cards(m)
-            for i = 1, k do
-                h.holes[1][i] = deck[i]
-                h.holes[2][i] = deck[k + i]
+            -- one card at a time round the table, starting left of the button, as a dealer would
+            local at = 0
+            for c = 1, k do
+                for _, i in ipairs(fromButton(m, h, h.inHand)) do
+                    at = at + 1
+                    h.holes[i][c] = deck[at]
+                end
             end
-            for i = 1, 5 do h.board[i] = deck[2 * k + i] end
+            for i = 1, 5 do h.board[i] = deck[at + i] end
             h.phase = "bet"
-            begin(m, h, h.button)
+            -- before the flop the player after the big blind starts (heads-up that's the button)
+            begin(m, h, h.bbSeat)
         end
     else
         local ok, err = bettingAction(m, h, seat, msg)
@@ -332,31 +579,56 @@ end
 -- Everything needed to rebuild the match: the options, the current hand's start and messages, and
 -- the last finished hand the same way (so its result can still be shown). The secret for a hand
 -- that hasn't been revealed is never in here; only messages already sent are.
---   "P1;opts;n;s1;s2;msgs;lastN;ls1;ls2;lastMsgs"
-local function replay(m, n, s1, s2, msgs)
-    Engine.StartHand(m, n, s1, s2)
+--   "P2;opts;seats;<hand>;<last hand>"   with each hand "n;button;stacks;places;msgs"
+-- places: "-" for a seat still playing, "5" for one that went bust in 5th, "L4" for one that left in 4th
+local function seatsText(m, out, place)
+    local t = {}
+    for i = 1, m.seats do
+        t[i] = not out[i] and "-" or ((out[i] == "left" and "L" or "") .. tostring(place[i] or 0))
+    end
+    return table.concat(t, ",")
+end
+local function handText(m, h)
+    if not h then return "0;0;;;" end
+    return ("%d;%d;%s;%s;%s"):format(h.n, h.button, table.concat(h.startStacks, ","),
+        seatsText(m, h.startOut, h.startPlace), table.concat(h.log, ","))
+end
+local function replay(m, n, button, stacksText, seatText, msgs)
+    local stacks, out, place = {}, {}, {}
+    for v in stacksText:gmatch("[^,]+") do stacks[#stacks + 1] = tonumber(v) end
+    local i = 0
+    for v in seatText:gmatch("[^,]+") do
+        i = i + 1
+        if v ~= "-" then
+            out[i] = v:sub(1, 1) == "L" and "left" or "bust"
+            place[i] = tonumber((v:gsub("^L", ""))) or 0
+        end
+    end
+    if #stacks ~= m.seats or i ~= m.seats then return false end
+    if not (button >= 1 and button <= m.seats) then return false end
+    Engine.StartHand(m, n, stacks, button, out, place)
     for msg in tostring(msgs or ""):gmatch("[^,]+") do
-        local seat = Engine.Expect(m)
+        local seat = msg:sub(1, 1) == "O" and 0 or Engine.Expect(m)
         if not seat or not Engine.Apply(m, seat, msg) then return false end
     end
     return true
 end
 function Engine.Snapshot(m)
-    local h, l = m.hand, m.last
-    local cur = (not m.over and h) and ("%d;%d;%d;%s"):format(h.n, h.startStacks[1], h.startStacks[2], table.concat(h.log, ",")) or "0;0;0;"
-    local last = l and ("%d;%d;%d;%s"):format(l.n, l.startStacks[1], l.startStacks[2], table.concat(l.log, ",")) or "0;0;0;"
-    return ("P1;%s;%s;%s"):format(m.optsText, cur, last)
+    return ("P2;%s;%d;%s;%s"):format(m.optsText, m.seats, handText(m, not m.over and m.hand or nil), handText(m, m.last))
 end
 function Engine.FromSnapshot(text, salt)
-    local opts, n, s1, s2, msgs, ln, l1, l2, lmsgs =
-        tostring(text or ""):match("^P1;([^;]*);(%d+);(%d+);(%d+);([^;]*);(%d+);(%d+);(%d+);([^;]*)$")
+    local opts, seats, n, b, s, p, msgs, ln, lb, ls, lp, lmsgs = tostring(text or ""):match(
+        "^P2;([^;]*);(%d+);(%d+);(%d+);([^;]*);([^;]*);([^;]*);(%d+);(%d+);([^;]*);([^;]*);([^;]*)$")
     if not opts then return nil end
-    local m = Engine.NewMatch(opts, salt)
+    local m = Engine.NewMatch(opts, salt, tonumber(seats))
+    if m.seats ~= tonumber(seats) then return nil end
     n, ln = tonumber(n), tonumber(ln)
-    if ln > 0 and not replay(m, ln, tonumber(l1), tonumber(l2), lmsgs) then return nil end
+    -- the burned chips aren't kept: Chips() counts what is at the table, which is all anyone needs
+    if ln > 0 and not replay(m, ln, tonumber(lb), ls, lp, lmsgs) then return nil end
     if n > 0 then
+        if m.over then return nil end -- the last hand ended the match, so there is no hand after it
         local last = m.last
-        if not replay(m, n, tonumber(s1), tonumber(s2), msgs) then return nil end
+        if not replay(m, n, tonumber(b), s, p, msgs) then return nil end
         if m.last == nil then m.last = last end
     elseif not m.over then
         return nil
@@ -364,17 +636,26 @@ function Engine.FromSnapshot(text, salt)
     return m
 end
 
--- a line for the hand history: "raises to 120"
+-- a line for the hand history: "Raise to 120"
 function Engine.Said(said)
     if not said then return nil end
     local k, amt = said[1], said[2]
     local a = said.allin and " (all-in)" or ""
     if k == "fold" then return "Fold" end
+    if k == "left" then return "Left" end
     if k == "check" then return "Check" end
     if k == "call" then return "Call" .. a end
     if k == "bet" then return "Bet " .. amt .. a end
     if k == "raise" then return "Raise to " .. amt .. a end
     return nil
+end
+
+-- "1st", "2nd", "3rd", "4th"
+function Engine.Ordinal(n)
+    n = tonumber(n) or 0
+    local s = "th"
+    if n % 100 < 11 or n % 100 > 13 then s = ({ "st", "nd", "rd" })[n % 10] or "th" end
+    return n .. s
 end
 
 return Engine

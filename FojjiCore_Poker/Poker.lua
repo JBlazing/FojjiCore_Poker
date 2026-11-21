@@ -1,14 +1,15 @@
--- Heads-Up Poker for the FojjiCore games menu: No-Limit Hold'em and Pot-Limit Omaha, one on one,
--- over whispers (Games.Duel). The rules live in Engine.lua and Eval.lua; this file is the glue to
--- FojjiCore, the deal handshake, and the window.
+-- Poker for the FojjiCore games menu: No-Limit Hold'em and Pot-Limit Omaha for 2 to 9 players.
+-- The host opens a table, invites people from their group or guild, and starts when 2 to 9 are
+-- sitting. The rules live in Engine.lua and Eval.lua, the lobby and the messages in Table.lua; this
+-- file runs the deal handshake and draws the window.
 --
--- Nothing runs while no match is going. During a match the only timer is a ten-second heartbeat
--- that re-sends a lost message (and asks the other player to catch us up after one went missing).
+-- Nothing runs while no game is going. During a game the only timer is Table.lua's heartbeat, which
+-- re-sends a lost message and asks the host to catch us up after one went missing.
 local ADDON, ns = ...
 local Addon = FojjiCoreNS
 local Games = Addon and Addon.Games
-if not (Games and Games.Register and Games.Duel and Games.Window and Games.HeaderTools and Games.ResultCard
-    and Games.PeopleRow and Games.Dress) then
+if not (Games and Games.Register and Games.Window and Games.HeaderTools and Games.ResultCard
+    and Games.PeopleRow and Games.Dress and ns.Table) then
     local f = CreateFrame("Frame")
     f:RegisterEvent("PLAYER_LOGIN")
     f:SetScript("OnEvent", function()
@@ -18,15 +19,15 @@ if not (Games and Games.Register and Games.Duel and Games.Window and Games.Heade
 end
 local FDJ = Games.Base
 local Kit, C = FDJ.Kit, FDJ.Colors
-local Engine, Eval = ns.Engine, ns.Eval
-local floor, min, max = math.floor, math.min, math.max
+local Engine, Eval, T = ns.Engine, ns.Eval, ns.Table
+local floor, min, max, cos, sin, rad = math.floor, math.min, math.max, math.cos, math.sin, math.rad
 
 local PK = {}
 Games.Poker = PK
 ns.PK = PK
 
 local KEY = "poker"
-local LABEL = "Heads-Up Poker"
+local LABEL = "Poker"
 local TEX = "Interface\\AddOns\\FojjiCore\\textures\\UI\\"
 local MEDIA = Games.Media
 local GOLD = Games.Gold or { 1.00, 0.82, 0.20 }
@@ -38,11 +39,13 @@ Games.Themes[KEY] = { accent = { 0.38, 0.86, 0.56 }, head = { 0.02, 0.08, 0.05 }
 local snd = Games.Sound(KEY)
 
 local HELP = {
-    "Heads-up poker against one friend, for play chips.",
+    "Poker for 2 to 9 friends, for play chips.",
+    "Open a table, invite people from your group or guild, and start when everyone is sitting.",
     "No-Limit Hold'em: two cards each, bet any amount up to your stack.",
     "Pot-Limit Omaha: four cards each. Use exactly two of them with three from the board. The biggest bet is the size of the pot.",
-    "The button posts the small blind, acts first before the flop and last after it.",
-    "Each deck is shuffled from a secret of each player's, so neither can stack it.",
+    "The two players after the button post the blinds. Heads-up, the button posts the small blind.",
+    "Lose every chip and you're out; the last player with chips wins the table.",
+    "Each deck is shuffled from a secret of two players', so nobody can stack it.",
 }
 
 -- ---------------------------------------------------------------- saved settings
@@ -50,6 +53,7 @@ local function db()
     FojjiCorePokerDB = type(FojjiCorePokerDB) == "table" and FojjiCorePokerDB or {}
     local d = FojjiCorePokerDB
     d.secrets = type(d.secrets) == "table" and d.secrets or {}
+    d.recent = type(d.recent) == "table" and d.recent or {}
     d.variant = Engine.VARIANTS[d.variant or ""] and d.variant or "NL"
     d.stackBB = tonumber(d.stackBB) or 100
     d.level = tonumber(d.level) or 0
@@ -60,74 +64,77 @@ local function chosenOpts()
     local d = db()
     return Engine.OptsText({ variant = d.variant, stackBB = d.stackBB, level = d.level })
 end
+-- people you played with lately (for the Recent list)
+local function remember(names)
+    local d = db()
+    for _, n in ipairs(names) do
+        if not Games.Same(n, T.Me()) then
+            for i = #d.recent, 1, -1 do if Games.Same(d.recent[i], n) then table.remove(d.recent, i) end end
+            table.insert(d.recent, 1, n)
+        end
+    end
+    while #d.recent > 12 do table.remove(d.recent) end
+end
 
 -- ---------------------------------------------------------------- names
 local function short(n) return n and Games.Name(n) or "?" end
 local function paintName(n) return "|cff" .. Games.ClassHex(short(n), true) .. short(n) .. "|r" end
 local function trim(s) return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", "")) end
+-- "Full house, Kings over Sevens" -> "Full house"
+local function kind(name) return name and (name:match("^([^,]+)") or name) or nil end
 
--- ---------------------------------------------------------------- match state
-local D, win
-local match, session -- the engine state and the duel session it belongs to
+-- ---------------------------------------------------------------- game state
+local win
 local paint, paintLobby -- the window (further down)
-local function mySeat() return session and (session.first and 1 or 2) or 1 end
-local function live()
-    return match ~= nil and session ~= nil and match.sid == session.id and D:Session() == session
+local function game() return T.game end
+local function mySeat() return T.game and T.game.me end
+local function playing() return T.Playing() end
+-- I went bust, left, or was taken out, but the game goes on without me
+local function iAmOut()
+    local g = T.game
+    if not g then return false end
+    local m = g.match
+    local h = m.hand
+    return m.out[g.me] ~= nil or (h.left and h.left[g.me] ~= nil) or false
 end
-local function playing() return live() and not match.over and not session.over end
 local function myTurn()
-    if not playing() then return false end
-    local who, kind = Engine.Expect(match)
-    return who == mySeat() and kind == "A"
+    local g = T.game
+    if not playing() or g.pending then return false end
+    local who, k = Engine.Expect(g.match)
+    return who == g.me and k == "A"
 end
-
-local function bind(s, m)
-    session, match = s, m
-    m.sid = s.id
-    -- only this match's deal secrets are worth keeping
-    local d = db()
-    for k in pairs(d.secrets) do
-        if k:sub(1, #s.id + 1) ~= s.id .. ":" then d.secrets[k] = nil end
-    end
-end
-
-local function reachable(name)
-    if not name then return false end
-    if Games.Near(name) or Games.Near(short(name)) then return true end
-    if IsInGuild and IsInGuild() and GetGuildRosterInfo then
-        for i = 1, (tonumber(GetNumGuildMembers and GetNumGuildMembers()) or 0) do
-            local n, _, _, _, _, _, _, _, online = GetGuildRosterInfo(i)
-            if type(n) == "string" and online and Games.Same(n, name) then return true end
-        end
-    end
-    return false
+local function nameAt(seat)
+    local g = T.game
+    return g and g.names[seat]
 end
 
 local function openWhenCalm()
     if Games.Fighting() and Games.CombatHideOn() then
-        Games.AfterCombat(function() if live() and not (win and win:IsShown()) then PK.Show() end end)
+        Games.AfterCombat(function() if T.game and not (win and win:IsShown()) then PK.Show() end end)
         return
     end
     PK.Show()
 end
 
--- the match ended by its own rules, by a resignation, or by someone leaving
+-- my result goes in the record once: when the game is won, or as soon as I'm out of it
 local function settle()
-    if not (match and match.over and session) then return end
+    local g = T.game
+    if not g then return end
+    local m = g.match
     local d = db()
-    if d.countedId ~= session.id then
-        d.countedId = session.id
-        if match.winner == mySeat() then d.w = d.w + 1 else d.l = d.l + 1 end
+    if d.countedId == g.id then return end
+    if m.over or m.place[g.me] then
+        d.countedId = g.id
+        if m.winner == g.me then d.w = d.w + 1 else d.l = d.l + 1 end
         snd.Play("chess-end")
     end
-    if not session.over then D:Finish(match.winner == mySeat() and "win" or "lose") end
 end
 
 -- ---------------------------------------------------------------- the all-in runout
--- When the betting stops early because someone is all-in, the engine deals the rest of the board in
--- one go. The window doesn't: it turns both hands over, drops the flop one card at a time, slides the
--- turn in face down and flips it, then holds on a face-down river before the last flip. Only then
--- does it say who won. The next deal waits for it (see RunLength in drive).
+-- When the betting stops early because everyone is all-in, the engine deals the rest of the board in
+-- one go. The window doesn't: it turns every hand still in over, drops the flop one card at a time,
+-- slides the turn in face down and flips it, then holds on a face-down river before the last flip.
+-- Only then does it say who won. The next deal waits for it (see RunLength in drive).
 -- Each step: seconds after the previous one, how many board cards show, and whether the newest is
 -- still face down.
 local function runSteps(from)
@@ -153,14 +160,15 @@ function PK.RunLength(r)
     return t
 end
 
-local run -- { n = hand number, shown = board cards up, back = newest one face down, done = bool, pop = {} }
+local run -- { id, n = hand number, shown = board cards up, back = newest one face down, done = bool, pop = {} }
 local function running(view)
-    return run ~= nil and not run.done and view ~= nil and view.n == run.n
+    local g = T.game
+    return run ~= nil and not run.done and view ~= nil and g ~= nil and run.id == g.id and view.n == run.n
 end
 
 local function startRun(l, onDone)
     local r = l.result
-    local me = { n = l.n, shown = r.runFrom, pop = {}, flipFoe = true }
+    local me = { id = T.game.id, n = l.n, shown = r.runFrom, pop = {}, flip = true }
     run = me
     local steps = runSteps(r.runFrom)
     local i = 1
@@ -186,67 +194,23 @@ local function startRun(l, onDone)
     C_Timer.After(steps[1][1], step)
 end
 
-local drive
-local alerted
-local function afterChange(why, msg)
-    if match and match.over then settle() end
-    if why == "foe" or why == "me" then
-        if msg and msg:find("^[FXCB]") then snd.Play("chess-move") end
-        session.movedAt = GetTime()
-    end
-    -- a hand just finished: a little sound for the pot
-    if match and match.last and match.last.n ~= PK.seenHand then
-        -- watched it end live (not a reload or a resume), so hand 1 counts too
-        local hadSeen = PK.seenHand ~= nil or why == "me" or why == "foe"
-        PK.seenHand = match.last.n
-        local r = match.last.result
-        local won = r and r.winner == mySeat()
-        if hadSeen and r and r.showdown and r.runFrom then
-            -- an all-in before the river: play the board out, and only cheer at the end
-            startRun(match.last, function() if won then snd.Play("deathroll-win") end end)
-        elseif hadSeen and won then
-            snd.Play("deathroll-win")
-        end
-    end
-    drive()
-    if myTurn() then
-        local key = session.id .. ":" .. match.hand.n .. ":" .. #match.hand.log
-        if alerted ~= key and not (win and win:IsShown()) then
-            alerted = key
-            FDJ.Print(("Poker: your turn against %s (hand %d). Type /fc poker."):format(paintName(session.foe), match.hand.n))
-        end
-    end
-    if win and win:IsShown() then paint() end
-    Games.Notify(KEY)
-end
-
--- applies one of our own messages and sends it
-local function send(msg)
-    if not playing() then return false end
-    local ok, err = Engine.Apply(match, mySeat(), msg)
-    if not ok then
-        FDJ.Print("Poker: that didn't go through (" .. tostring(err) .. ").")
-        return false
-    end
-    D:Move(msg)
-    afterChange("me", msg)
-    return true
-end
-
+-- ---------------------------------------------------------------- the deal
 -- The deal handshake runs by itself: whoever the engine is waiting on for K, S or R sends it.
--- After a hand there is a short pause so both players can see how it ended.
+-- After a hand there is a short pause so everyone can see how it ended.
 local driveKey, driveAt = nil, 0
-drive = function()
-    if not playing() then return end
-    local who, kind = Engine.Expect(match)
-    if who ~= mySeat() or kind == "A" then return end
-    local h = match.hand
-    local key = session.id .. ":" .. h.n .. ":" .. kind .. ":" .. #h.log
-    if driveKey == key and GetTime() - driveAt < 8 then return end
-    driveKey, driveAt = key, GetTime()
+local function drive()
+    local g = T.game
+    if not playing() or g.pending then return end
+    local who, k = Engine.Expect(g.match)
+    if who ~= g.me or k == "A" then return end
+    local m = g.match
+    local h = m.hand
+    local dkey = g.id .. ":" .. h.n .. ":" .. k .. ":" .. #h.log
+    if driveKey == dkey and GetTime() - driveAt < 8 then return end
+    driveKey, driveAt = dkey, GetTime()
     local wait = 0.3
-    if kind == "K" then
-        local l = match.last
+    if k == "K" then
+        local l = m.last
         if l and l.n == h.n - 1 and #h.log == 0 then
             wait = (l.result and l.result.showdown) and 5 + PK.RunLength(l.result) or 2.5
         else
@@ -254,153 +218,201 @@ drive = function()
         end
     end
     C_Timer.After(wait, function()
-        if driveKey ~= key or not playing() or match.hand ~= h then return end
-        local who2, kind2 = Engine.Expect(match)
-        if who2 ~= mySeat() or kind2 ~= kind then return end
+        if driveKey ~= dkey or T.game ~= g or not playing() or g.match.hand ~= h or g.pending then return end
+        local who2, k2 = Engine.Expect(g.match)
+        if who2 ~= g.me or k2 ~= k then return end
         -- a whisper to someone offline only prints an error: the heartbeat tries again later
-        if not reachable(session.foe) then driveKey = nil return end
+        if not T.IsHost() and not T.Reachable(g.host) then driveKey = nil return end
         local d = db()
-        local slot = session.id .. ":" .. h.n
-        if kind == "K" then
+        local slot = g.id .. ":" .. h.n
+        if k == "K" then
             local secret = ("%d.%d.%d"):format(math.random(0, 16777215), math.random(0, 16777215), floor(GetTime() * 1000) % 1000000)
             d.secrets[slot] = secret
-            send("K" .. Engine.Commit(secret, match.salt, h.n))
-        elseif kind == "S" then
-            send("S" .. math.random(1, 2147483000))
-        elseif kind == "R" then
+            T.Act("K" .. Engine.Commit(secret, m.salt, h.n))
+        elseif k == "S" then
+            T.Act("S" .. math.random(1, 2147483000))
+        elseif k == "R" then
             local secret = d.secrets[slot]
-            if secret and Engine.Commit(secret, match.salt, h.n) == h.commit then
-                send("R" .. secret)
+            if secret and Engine.Commit(secret, m.salt, h.n) == h.commit then
+                T.Act("R" .. secret)
             else
-                send("Z") -- the secret was lost (the game closed before it was saved): deal again
+                T.Act("Z") -- the secret was lost (the game closed before it was saved): deal again
             end
         end
     end)
 end
 
--- A whisper can go missing. While we wait on the other player, ask now and then how far they are;
--- whoever is ahead sends the whole position (P = "I'm at move n", T = "here is move n").
-local pingAt = 0
-local function heartbeat()
-    C_Timer.After(10, heartbeat)
-    if not playing() then return end
-    local who = Engine.Expect(match)
-    if who == mySeat() then drive() return end
-    if GetTime() - (session.movedAt or 0) < 15 or GetTime() - pingAt < 20 then return end
-    if not reachable(session.foe) then return end
-    pingAt = GetTime()
-    D:Send("P", session.n)
-end
-C_Timer.After(10, heartbeat)
-
--- ---------------------------------------------------------------- the duel
-D = Games.Duel.Make("PK", LABEL, {
-    store = "poker",
-    options = chosenOpts,
-    describe = function(opts) return Engine.Describe(opts) end,
-    onStart = function(s, resumed)
-        if not (match and match.sid == s.id) then bind(s, Engine.NewMatch(s.opts, s.id)) else session = s end
-        PK.note, PK.seenHand, alerted, run = nil, nil, nil, nil
-        if not resumed then
-            FDJ.Print(("Heads-up %s with %s has begun. %s"):format(Engine.Describe(s.opts), paintName(s.foe),
-                mySeat() == 1 and "You have the button first." or "They have the button first."))
-            snd.Play("chess-start")
-        end
-        if win and win.result and win.result:IsOpen() then win.result:Close() end
-        openWhenCalm()
-        afterChange("start")
-    end,
-    onMove = function(s, n, data)
-        if not (match and match.sid == s.id) then bind(s, Engine.NewMatch(s.opts, s.id)) end
-        session = s
-        local ok = not match.over and Engine.Apply(match, 3 - mySeat(), data)
-        if not ok then
-            -- not a move we can make yet: don't count it, so a fresh copy of the position can fix things
-            if s.n == n then s.n = n - 1 end
-            if match.cheat then FDJ.Print(("Poker: %s's deal didn't check out. You can leave the match."):format(paintName(s.foe))) end
-            return
-        end
-        afterChange("foe", data)
-    end,
-    onEnd = function(s, why, mine)
-        if not (match and match.sid == s.id) or match.over then return end
-        match.over, match.ended = true, why
-        match.winner = mine and (3 - mySeat()) or mySeat()
-        if not mine then
-            FDJ.Print(("Poker: %s %s. You win the match!"):format(paintName(s.foe), why == "resign" and "gave up" or "left"))
-        end
-        afterChange("end")
-    end,
-    onGone = function() if win and win:IsShown() then paint() end end,
-    onInvite = function(_, state, name)
-        PK.note = state == "declined" and (short(name) .. " said no this time.")
-            or state == "expired" and (short(name) .. " didn't answer.") or nil
+local seenHand, seenGame, alerted
+local function afterChange(why, text)
+    local g = T.game
+    if not g then
+        run = nil
         if win and win:IsShown() then paint() end
-    end,
-    onMessage = function(s, sub, rest)
-        if not (session == s and match and match.sid == s.id) then return end
-        if sub == "P" then
-            local n = tonumber(rest)
-            if not n then return end
-            if s.n > n then
-                D:Send("T", s.n, Engine.Snapshot(match))
-            elseif s.n < n and GetTime() - pingAt > 5 then
-                pingAt = GetTime()
-                D:Send("P", s.n)
-            end
-        elseif sub == "T" then
-            local n, snap = rest:match("^(%d+)~(.*)$")
-            n = tonumber(n)
-            if not (n and n > s.n) then return end
-            local m = Engine.FromSnapshot(snap, s.id)
-            if not m then return end
-            bind(s, m)
-            s.n = n
-            D:Save()
-            afterChange("sync")
-        end
-    end,
-    snapshot = function(s)
-        if match and match.sid == s.id then return Engine.Snapshot(match) end
-        return ""
-    end,
-    restore = function(s, text)
-        local m = Engine.FromSnapshot(text, s.id)
-        if not m then return end
-        bind(s, m)
-        afterChange("sync")
-    end,
-})
-PK.Duel = D
-
-function PK.Challenge(name)
-    name = trim(name)
-    if name == "" then
-        PK.note = "Type a name, or pick someone from the lists."
-        if win then paint() end
-        return false
+        Games.Notify(KEY)
+        return
     end
-    if D:Active() then return false end
-    if D:Session() then D:Leave() end
-    PK.note = nil
-    local ok = D:Challenge(name, chosenOpts())
-    if win then paint() end
-    return ok
-end
-function PK.GiveUp()
-    if playing() then D:Resign() end
-end
-function PK.Menu()
-    if D:Session() then D:Leave() end
-    match, session = nil, nil
-    if win then paint() end
+    if seenGame ~= g.id then
+        -- a different game: forget the last one's runout and sounds, keep only this game's secrets
+        seenGame, seenHand, alerted, run = g.id, nil, nil, nil
+        local d = db()
+        for k in pairs(d.secrets) do
+            if k:sub(1, #g.id + 1) ~= g.id .. ":" then d.secrets[k] = nil end
+        end
+        remember(g.names)
+        if win and win.result and win.result:IsOpen() then win.result:Close() end
+    end
+    local m = g.match
+    settle()
+    if (why == "foe" or why == "me") and text and text:find("^[FXCB]") then snd.Play("chess-move") end
+    -- a hand just finished: a little sound for the pot
+    if m.last and m.last.n ~= seenHand then
+        -- watched it end live (not a reload or a catch-up), so hand 1 counts too
+        local live = seenHand ~= nil or why == "me" or why == "foe"
+        seenHand = m.last.n
+        local r = m.last.result
+        local won = r and r.won and (r.won[g.me] or 0) > 0
+        if live and r and r.showdown and r.runFrom then
+            -- an all-in before the river: play the board out, and only cheer at the end
+            startRun(m.last, function() if won then snd.Play("deathroll-win") end end)
+        elseif live and won then
+            snd.Play("deathroll-win")
+        end
+    end
+    drive()
+    if myTurn() then
+        local akey = g.id .. ":" .. m.hand.n .. ":" .. #m.hand.log
+        if alerted ~= akey and not (win and win:IsShown()) then
+            alerted = akey
+            FDJ.Print(("Poker: your turn (hand %d). Type /fc poker."):format(m.hand.n))
+        end
+    end
+    if win and win:IsShown() then paint() end
     Games.Notify(KEY)
 end
-function PK.Rematch()
-    if D:Rematch() then
-        PK.note = "Rematch offered to " .. short(session and session.foe) .. "."
+
+-- ---------------------------------------------------------------- the table's callbacks
+PK.note = nil
+T.cb.options = chosenOpts
+T.cb.onChange = function(why, text)
+    if why == "start" then
+        local g = T.game
+        local others = #g.names - 1
+        FDJ.Print(("Poker: %s has begun with %d %s. %s"):format(Engine.Describe(g.opts), others,
+            others == 1 and "other player" or "other players", T.IsHost() and "You're the host." or ""))
+        snd.Play("chess-start")
+        PK.note = nil
+        afterChange(why, text)
+        openWhenCalm()
+        return
     end
-    if win then paint() end
+    if why == "resume" then
+        local g = T.game
+        local function toast()
+            if T.game ~= g or T.Over(g) then return end
+            Kit.Toast("Your game of |cffffd100Poker|r is still going.", {
+                { "Open", function() if T.game == g then PK.Show() end end },
+            }, 40)
+        end
+        if Games.Fighting() then Games.AfterCombat(toast) else toast() end
+    end
+    if why == "end" then
+        local g = T.game
+        if g and g.ended == "closed" then
+            FDJ.Print(("Poker: %s closed the table."):format(paintName(g.host)))
+        end
+    end
+    afterChange(why, text)
+end
+T.cb.onTick = function()
+    drive()
+    -- the host's "Remove" button appears after a long wait, so repaint now and then
+    if win and win:IsShown() and T.IsHost() then paint() end
+end
+T.cb.onNote = function(text)
+    PK.note = text
+    if win and win:IsShown() then paint() end
+end
+T.cb.onClosed = function(text)
+    PK.note = text
+    FDJ.Print("Poker: " .. text)
+    if win and win:IsShown() then paint() end
+end
+
+local function showInvite(o)
+    if T.Offer(o.host) ~= o or o.toast then return end
+    o.toast = Kit.Toast(o.text, {
+        { "Decline", function() T.Decline(o.host) if win and win:IsShown() then paint() end end },
+        { "Join", function() PK.Accept(o.host) end },
+    }, 60)
+end
+T.cb.onInvite = function(o)
+    o.text = ("%s invites you to a table of |cffffd100Poker|r (%s)."):format(paintName(o.host), Engine.Describe(o.opts))
+    FDJ.Print(o.text .. " Type |cffffd100/fc poker|r to answer.")
+    if win and win:IsShown() then paint() end
+    if Games.Fighting() then Games.AfterCombat(function() showInvite(o) end) return end
+    showInvite(o)
+end
+
+-- ---------------------------------------------------------------- what the buttons do
+local function report(ok, why)
+    if not ok and why then PK.note = why end
+    if win and win:IsShown() then paint() end
+    return ok
+end
+function PK.Open()
+    PK.note = nil
+    return report(T.Open(chosenOpts()))
+end
+function PK.Invite(name)
+    PK.note = nil
+    local ok, why = T.Invite(name)
+    if ok then PK.note = "Invite sent to " .. short(Games.Wire(trim(name))) .. "." end
+    if ok and win and win.lobby then win.lobby.name:SetText("") end
+    return report(ok, why)
+end
+function PK.InviteGroup()
+    local n = T.InviteGroup()
+    PK.note = n > 0 and ("Invited %d from your group."):format(n) or "Nobody else in your group to invite."
+    return report(n > 0)
+end
+function PK.Start() return report(T.Start()) end
+function PK.Accept(host)
+    local o = T.Offer(host)
+    if o and o.toast and o.toast.Dismiss then o.toast.Dismiss() end
+    PK.note = nil
+    local ok, why = T.Accept(host)
+    if ok then PK.Show() end
+    return report(ok, why)
+end
+-- leaves the lobby or the table; walking out of a game you're still in counts as a loss
+function PK.Leave()
+    local g = T.game
+    if g and playing() and not iAmOut() then
+        local d = db()
+        if d.countedId ~= g.id then
+            d.countedId = g.id
+            d.l = d.l + 1
+        end
+    end
+    T.Leave()
+    PK.note = nil
+    if win and win:IsShown() then paint() end
+    Games.Notify(KEY)
+end
+PK.Menu = PK.Leave
+PK.GiveUp = PK.Leave
+-- after a game: a new table with the same people invited
+function PK.NewTable()
+    local g = T.game
+    local names = g and g.names or {}
+    T.Leave()
+    T.Open(chosenOpts())
+    local asked = 0
+    for _, n in ipairs(names) do
+        if not Games.Same(n, T.Me()) and T.Invite(n) then asked = asked + 1 end
+    end
+    PK.note = asked > 0 and ("Invited the %d from last game."):format(asked) or nil
+    if win and win:IsShown() then paint() end
 end
 
 -- ---------------------------------------------------------------- cards
@@ -501,32 +513,50 @@ local function newCard(parent)
 end
 
 -- ---------------------------------------------------------------- the window
-local W, H, HEAD, BAR = 640, 540, 38, 104
+local W, H, HEAD, BAR = 900, 640, 38, 104
 local TH = H - HEAD - 8 - BAR -- table height
+local RX, RY = 345, 178        -- the ellipse the other seats sit on, from the middle of the felt
+local ME_Y = -185              -- your own cards, near the bottom edge
+-- where the other seats go for each table size, as angles (degrees, 90 is the top). The first is the
+-- player on your left, then round the table the way the deal goes.
+local ANGLES = {
+    [2] = { 90 },
+    [3] = { 150, 30 },
+    [4] = { 180, 90, 0 },
+    [5] = { 200, 130, 50, -20 },
+    [6] = { 205, 145, 90, 35, -25 },
+    [7] = { 210, 160, 115, 65, 20, -30 },
+    [8] = { 215, 170, 128, 90, 52, 10, -35 },
+    [9] = { 218, 180, 140, 105, 75, 40, 0, -38 },
+}
 
 local function newPlate(parent)
     local p = CreateFrame("Frame", nil, parent)
-    p:SetSize(150, 54)
+    p:SetSize(150, 50)
     Games.Panel(p, "dark")
     p.ring = p:CreateTexture(nil, "BACKGROUND", nil, -1)
     p.ring:SetPoint("TOPLEFT", -2, 2)
     p.ring:SetPoint("BOTTOMRIGHT", 2, -2)
     p.ring:SetColorTexture(GREEN[1], GREEN[2], GREEN[3], 0.85)
     p.ring:Hide()
-    p.name = Kit.Text(p, 13, C.white)
-    p.name:SetPoint("TOPLEFT", 10, -9)
-    p.name:SetPoint("RIGHT", -34, 0)
-    p.stack = Kit.Text(p, 15, GOLD)
-    p.stack:SetPoint("BOTTOMLEFT", 10, 8)
+    p.name = Kit.Text(p, 12, C.white)
+    p.name:SetPoint("TOPLEFT", 9, -8)
+    p.name:SetPoint("RIGHT", -30, 0)
+    p.stack = Kit.Text(p, 14, GOLD)
+    p.stack:SetPoint("BOTTOMLEFT", 9, 7)
     p.tag = Kit.Text(p, 10, SOFT, "RIGHT")
-    p.tag:SetPoint("BOTTOMRIGHT", -9, 10)
-    p.button = Games.Chip(p, 20, 20)
-    p.button:SetPoint("TOPRIGHT", -7, -7)
+    p.tag:SetPoint("BOTTOMRIGHT", -8, 9)
+    p.button = Games.Chip(p, 18, 18)
+    p.button:SetPoint("TOPRIGHT", -6, -6)
     p.button:SetFill(0.95, 0.93, 0.86, 1)
     p.button.text:SetText("D")
     p.button.text:SetTextColor(0.1, 0.1, 0.1)
-    p.said = Kit.Text(parent, 12, SOFT, "CENTER")
-    p.said:SetPoint("TOP", p, "BOTTOM", 0, -5)
+    -- ring colours: green for whoever is to act, gold for a pot's winner
+    function p:Ring(color)
+        if not color then self.ring:Hide() return end
+        self.ring:SetColorTexture(color[1], color[2], color[3], 0.85)
+        self.ring:Show()
+    end
     return p
 end
 local function newBet(parent)
@@ -534,6 +564,19 @@ local function newBet(parent)
     b:SetEdge(GOLD[1], GOLD[2], GOLD[3], 0.8)
     b.text:SetTextColor(GOLD[1], GOLD[2], GOLD[3])
     return b
+end
+
+-- a seat: the name plate, the hole cards and the chips bet this street
+local function newSeat(parent, mine)
+    local s = { mine = mine }
+    s.frame = CreateFrame("Frame", nil, parent)
+    s.frame:SetSize(150, 84)
+    s.plate = newPlate(s.frame)
+    s.row = CreateFrame("Frame", nil, s.frame)
+    s.cards = {}
+    for i = 1, 4 do s.cards[i] = newCard(s.row) end
+    s.bet = newBet(parent)
+    return s
 end
 
 local function buildLobby(f)
@@ -546,13 +589,15 @@ local function buildLobby(f)
     shade:SetAllPoints()
     shade:SetColorTexture(0, 0, 0, 0.6)
     local card = CreateFrame("Frame", nil, lobby)
-    card:SetSize(440, 412)
+    card:SetSize(560, 490)
     card:SetPoint("CENTER")
     Games.Panel(card)
+    local CW = 528
     local function caption(text, y)
         local t = Kit.Text(card, 11, SOFT)
         t:SetPoint("TOPLEFT", 16, y)
         t:SetText(text)
+        return t
     end
     local function rule(y)
         local t = card:CreateTexture(nil, "ARTWORK")
@@ -564,72 +609,178 @@ local function buildLobby(f)
     local function picker(y, defs, field)
         local g = Kit.Segmented(card, defs, function(k)
             db()[field] = k
+            T.SetOpts(chosenOpts())
             paintLobby()
         end)
-        g:SetSize(408, 26)
+        g:SetSize(CW, 26)
         g:SetPoint("TOPLEFT", 16, y)
         g:Layout()
         return g
     end
-    caption("GAME", -14)
+    -- the game: pickers for the host (or before there's a table), the host's choice for a guest
+    lobby.captions = {
+        caption("GAME", -14),
+        caption("STARTING STACK", -68),
+        caption("BLINDS", -122),
+    }
     lobby.variant = picker(-32, { { "NL", "No-Limit Hold'em" }, { "PLO", "Pot-Limit Omaha" } }, "variant")
-    caption("STARTING STACK", -68)
     lobby.stack = picker(-86, { { 50, "50 big blinds" }, { 100, "100 big blinds" }, { 200, "200 big blinds" } }, "stackBB")
-    caption("BLINDS", -122)
     lobby.level = picker(-140, { { 0, "Never go up" }, { 20, "Up every 20 hands" }, { 10, "Up every 10 hands" } }, "level")
+    lobby.chosen = Kit.Text(card, 14, C.white)
+    lobby.chosen:SetPoint("TOPLEFT", 16, -36)
+    lobby.chosen:SetWidth(CW)
     lobby.summary = Kit.Text(card, 12, C.text)
     lobby.summary:SetPoint("TOPLEFT", 16, -176)
-    lobby.summary:SetWidth(408)
-    rule(-200)
-    caption("CHALLENGE A FRIEND", -212)
-    lobby.name = Kit.Input(card, 288, 26, "Their name", nil, function() PK.Challenge(lobby.name:GetText()) end)
-    lobby.name:SetPoint("TOPLEFT", 16, -230)
-    lobby.challenge = Kit.Button(card, "Challenge", 112, 26, function()
-        if D.invite then D:Cancel() paint() else PK.Challenge(lobby.name:GetText()) end
-    end, "primary")
-    lobby.challenge:SetPoint("TOPRIGHT", -16, -230)
-    lobby.people = Games.PeopleRow(card, function(n) lobby.name:SetText(n or "") end, function() return D:Recent() end)
-    lobby.people:SetPoint("TOPLEFT", 16, -264)
+    lobby.summary:SetWidth(CW)
+    rule(-198)
+
+    -- who is sitting: nine seats in three columns
+    lobby.tableCap = caption("THE TABLE", -210)
+    lobby.count = Kit.Text(card, 11, SOFT, "RIGHT")
+    lobby.count:SetPoint("TOPRIGHT", -16, -210)
+    lobby.seats = {}
+    for i = 1, Engine.MAX_SEATS do
+        local t = Kit.Text(card, 12, C.white)
+        local col, row = (i - 1) % 3, floor((i - 1) / 3)
+        t:SetPoint("TOPLEFT", 16 + col * 178, -230 - row * 20)
+        t:SetWidth(172)
+        lobby.seats[i] = t
+    end
+    rule(-296)
+
+    -- inviting
+    lobby.inviteCap = caption("INVITE FRIENDS", -308)
+    lobby.name = Kit.Input(card, 288, 26, "Their name", nil, function() PK.Invite(lobby.name:GetText()) end)
+    lobby.name:SetPoint("TOPLEFT", 16, -326)
+    lobby.invite = Kit.Button(card, "Invite", 100, 26, function() PK.Invite(lobby.name:GetText()) end)
+    lobby.invite:SetPoint("LEFT", lobby.name, "RIGHT", 8, 0)
+    lobby.group = Kit.Button(card, "Invite group", 124, 26, function() PK.InviteGroup() end)
+    lobby.group:SetPoint("TOPRIGHT", -16, -326)
+    lobby.people = Games.PeopleRow(card, function(n) lobby.name:SetText(n or "") end, function() return db().recent end)
+    lobby.people:SetPoint("TOPLEFT", 16, -360)
     lobby.note = Kit.Text(card, 11, SOFT)
-    lobby.note:SetPoint("TOPLEFT", 16, -296)
-    lobby.note:SetWidth(408)
+    lobby.note:SetPoint("TOPLEFT", 16, -392)
+    lobby.note:SetWidth(CW - 110)
+    lobby.join = Kit.Button(card, "Join", 96, 24, function()
+        local o = T.LatestOffer()
+        if o then PK.Accept(o.host) end
+    end, "primary")
+    lobby.join:SetPoint("TOPRIGHT", -16, -388)
     lobby.need = Kit.Text(card, 11, SOFT)
-    lobby.need:SetPoint("TOPLEFT", 16, -314)
-    lobby.need:SetWidth(408)
-    lobby.need:SetText("They need FojjiCore Games and FojjiCore Poker too. Play chips only.")
-    rule(-338)
-    caption("YOUR RECORD", -350)
-    lobby.record = Kit.Text(card, 13, C.white)
-    lobby.record:SetPoint("TOPLEFT", 16, -368)
-    lobby.record:SetWidth(408)
+    lobby.need:SetPoint("TOPLEFT", 16, -412)
+    lobby.need:SetWidth(CW)
+    lobby.need:SetText("Everyone needs FojjiCore Games and FojjiCore Poker. Play chips only.")
+    rule(-434)
+
+    lobby.record = Kit.Text(card, 12, C.white)
+    lobby.record:SetPoint("BOTTOMLEFT", 16, 20)
+    lobby.go = Kit.Button(card, "Open a table", 150, 28, function()
+        if T.lobby and T.IsHost() then PK.Start() elseif not T.lobby then PK.Open() end
+    end, "primary")
+    lobby.go:SetPoint("BOTTOMRIGHT", -16, 14)
+    lobby.leave = Kit.Button(card, "Close table", 110, 28, function() PK.Leave() end)
+    lobby.leave:SetPoint("RIGHT", lobby.go, "LEFT", -8, 0)
     f.lobby = lobby
+end
+
+local function setEnabled(b, on)
+    if b:IsEnabled() ~= on then
+        if on then b:Enable() else b:Disable() end
+        if b.Paint then b:Paint() end
+    end
 end
 
 paintLobby = function()
     local f = win
     if not f then return end
     local L, d = f.lobby, db()
-    if L.variant.value ~= d.variant then L.variant:Select(d.variant, true) end
-    if L.stack.value ~= d.stackBB then L.stack:Select(d.stackBB, true) end
-    if L.level.value ~= d.level then L.level:Select(d.level, true) end
-    local o = Engine.ParseOpts(chosenOpts())
-    local sb, bb = Engine.Blinds(o, 1)
-    L.summary:SetText(("Both start with %s chips. Blinds %s / %s."):format(commas(o.stackBB * Engine.UNIT), commas(sb), commas(bb)))
-    if D.invite then
-        L.note:SetText("Waiting for " .. paintName(D.invite.to) .. " to answer...")
-        L.challenge:SetLabel("Cancel")
-    else
-        L.note:SetText(PK.note or "Pick a friend from your group or guild.")
-        L.challenge:SetLabel("Challenge")
+    local lob = T.lobby
+    local host = lob == nil or T.IsHost()
+    -- the game being set up
+    for _, c in ipairs(L.captions) do c:SetShown(host) end
+    L.variant:SetShown(host)
+    L.stack:SetShown(host)
+    L.level:SetShown(host)
+    L.chosen:SetShown(not host)
+    if host then
+        if L.variant.value ~= d.variant then L.variant:Select(d.variant, true) end
+        if L.stack.value ~= d.stackBB then L.stack:Select(d.stackBB, true) end
+        if L.level.value ~= d.level then L.level:Select(d.level, true) end
     end
-    L.challenge:SetWidth(112)
+    local opts = lob and lob.opts or chosenOpts()
+    local o = Engine.ParseOpts(opts)
+    local sb, bb = Engine.Blinds(o, 1)
+    if not host then
+        L.chosen:SetText(("%s's table\n\n|cffd8dbe0%s|r"):format(paintName(lob.host), Engine.Describe(opts)))
+    end
+    L.summary:SetText(("Everyone starts with %s chips. Blinds %s / %s."):format(commas(o.stackBB * Engine.UNIT), commas(sb), commas(bb)))
+
+    -- the seats
+    local players = lob and lob.players or {}
+    for i = 1, Engine.MAX_SEATS do
+        local n = players[i]
+        if n then
+            L.seats[i]:SetText(("%d  %s%s"):format(i, paintName(n), i == 1 and "  |cffaeb3bc(host)|r" or ""))
+        elseif lob then
+            L.seats[i]:SetText(("|cff5f636b%d  open seat|r"):format(i))
+        else
+            L.seats[i]:SetText(i == 1 and "|cffaeb3bcOpen a table, then invite up to eight friends.|r" or "")
+        end
+    end
+    local waiting = 0
+    if lob and lob.invited then for _ in pairs(lob.invited) do waiting = waiting + 1 end end
+    L.count:SetText(lob and (("%d of %d seated%s"):format(#players, Engine.MAX_SEATS,
+        waiting > 0 and ("  ·  %d invited"):format(waiting) or "")) or "")
+
+    -- inviting is for the host (inviting before there's a table opens one)
+    L.inviteCap:SetShown(host)
+    L.name:SetShown(host)
+    L.invite:SetShown(host)
+    L.group:SetShown(host)
+    L.people:SetShown(host)
+    setEnabled(L.group, FDJ.GroupChannel() ~= nil)
+
+    local offer = not lob and T.LatestOffer()
+    L.join:SetShown(offer and true or false)
+    if offer then
+        L.note:SetText(("%s invited you (%s)."):format(paintName(offer.host), Engine.Describe(offer.opts)))
+    elseif lob and lob.joining then
+        L.note:SetText("Joining " .. paintName(lob.host) .. "'s table...")
+    elseif lob and not host then
+        L.note:SetText(PK.note or ("Waiting for " .. paintName(lob.host) .. " to start the game..."))
+    else
+        L.note:SetText(PK.note or (lob and "Invite friends, then start with 2 to 9 players." or "Pick a game and open a table."))
+    end
+
+    -- the big buttons
+    if not lob then
+        L.go:SetLabel("Open a table")
+        L.go:Show()
+        setEnabled(L.go, true)
+        L.leave:Hide()
+    elseif host then
+        L.go:SetLabel(#players >= 2 and ("Start: %d players"):format(#players) or "Start")
+        L.go:Show()
+        setEnabled(L.go, #players >= 2)
+        L.leave:SetLabel("Close table")
+        L.leave:Show()
+    else
+        L.go:Hide()
+        L.leave:SetLabel("Leave")
+        L.leave:Show()
+    end
+    L.go:SetWidth(150)
+    L.leave:SetWidth(110)
     local total = d.w + d.l
-    L.record:SetText(total == 0 and "No matches yet." or ("Won %d  |cffaeb3bc·|r  Lost %d"):format(d.w, d.l))
+    L.record:SetText(total == 0 and "|cffaeb3bcNo games yet.|r" or ("Won %d  |cffaeb3bc·|r  Lost %d"):format(d.w, d.l))
 end
 
 -- the raise amount being picked, as "raise to" this street's total
 local amount, amountKey
-local function decisionKey() return match and (session.id .. ":" .. match.hand.n .. ":" .. #match.hand.log) end
+local function decisionKey()
+    local g = T.game
+    return g and (g.id .. ":" .. g.match.hand.n .. ":" .. #g.match.hand.log)
+end
 local function clampAmount(L, v)
     v = floor(tonumber(v) or L.minTo)
     return max(L.minTo, min(L.maxTo, v))
@@ -637,10 +788,16 @@ end
 local function presetAmount(L, which)
     if which == "min" then return L.minTo end
     if which == "max" then return L.maxTo end
-    local h = match.hand
-    local high = max(h.bet[1], h.bet[2])
-    local potAfterCall = h.pot + h.bet[1] + h.bet[2] + L.toCall
+    local m = T.game.match
+    local high = Engine.HighBet(m)
+    local potAfterCall = Engine.Pot(m) + L.toCall
     return clampAmount(L, high + floor(potAfterCall * which + 0.5))
+end
+local function legal() return T.game and Engine.Legal(T.game.match) end
+local function act(text)
+    local ok, why = T.Act(text)
+    if not ok and why then FDJ.Print("Poker: that didn't go through (" .. tostring(why) .. ").") end
+    return ok
 end
 
 local function buildBar(f)
@@ -651,28 +808,41 @@ local function buildBar(f)
     Kit.Line(bar, "TOP", C.borderDim)
     f.bar = bar
 
-    bar.giveUp = Kit.Button(bar, "Give up", 96, 28, function()
-        if playing() then
-            Kit.Confirm(("Give up the match against %s?"):format(short(session.foe)), PK.GiveUp)
+    bar.giveUp = Kit.Button(bar, "Leave", 96, 28, function()
+        local g = T.game
+        if playing() and not iAmOut() then
+            local text = T.IsHost() and "Leave and close the table for everyone?" or "Leave the table? Your chips leave with you."
+            Kit.Confirm(text, PK.Leave)
         else
-            PK.Menu()
+            PK.Leave()
         end
     end)
     bar.giveUp:SetPoint("BOTTOMLEFT", 12, 12)
+    -- the host can take out a player who stopped answering
+    bar.remove = Kit.Button(bar, "Remove", 150, 28, function()
+        local g = T.game
+        local seat = g and Engine.Expect(g.match)
+        if not (seat and seat ~= g.me and T.IsHost()) then return end
+        Kit.Confirm(("Take %s out of the game? Their chips leave the table."):format(short(g.names[seat])), function()
+            T.Remove(seat)
+        end)
+    end)
+    bar.remove:SetPoint("LEFT", bar.giveUp, "RIGHT", 8, 0)
+    bar.remove:Hide()
 
     bar.raise = Kit.Button(bar, "Raise", 160, 30, function()
-        local L = Engine.Legal(match)
-        if L and L.minTo and myTurn() then send("B" .. clampAmount(L, amount)) end
+        local L = legal()
+        if L and L.minTo and myTurn() then act("B" .. clampAmount(L, amount)) end
     end, "primary")
     bar.raise:SetPoint("BOTTOMRIGHT", -12, 12)
     bar.call = Kit.Button(bar, "Call", 130, 30, function()
-        local L = Engine.Legal(match)
-        if L and myTurn() then send(L.check and "X" or "C") end
+        local L = legal()
+        if L and myTurn() then act(L.check and "X" or "C") end
     end)
     bar.call:SetPoint("RIGHT", bar.raise, "LEFT", -8, 0)
     bar.fold = Kit.Button(bar, "Fold", 96, 30, function()
-        local L = Engine.Legal(match)
-        if L and L.fold and myTurn() then send("F") end
+        local L = legal()
+        if L and L.fold and myTurn() then act("F") end
     end)
     bar.fold:SetPoint("RIGHT", bar.call, "LEFT", -8, 0)
 
@@ -683,7 +853,7 @@ local function buildBar(f)
     bar.sizing = sizing
     bar.input = Kit.Input(sizing, 84, 26, "", function(_, text, user)
         if not user then return end
-        local L = Engine.Legal(match)
+        local L = legal()
         local v = tonumber(text)
         if L and L.minTo and v then
             amount = clampAmount(L, v)
@@ -691,7 +861,7 @@ local function buildBar(f)
             PK.PaintRaise()
         end
     end, function(self)
-        local L = Engine.Legal(match)
+        local L = legal()
         if L and L.minTo then
             amount = clampAmount(L, self:GetText())
             self:SetText(tostring(amount))
@@ -719,13 +889,13 @@ local function buildBar(f)
     if sl.SetObeyStepOnDrag then sl:SetObeyStepOnDrag(true) end
     sl:EnableMouseWheel(true)
     sl:SetScript("OnMouseWheel", function(self, delta)
-        local L = Engine.Legal(match)
+        local L = legal()
         if not (L and L.minTo) then return end
-        self:SetValue(clampAmount(L, (amount or L.minTo) + delta * match.hand.bb))
+        self:SetValue(clampAmount(L, (amount or L.minTo) + delta * T.game.match.hand.bb))
     end)
     sl:SetScript("OnValueChanged", function(self, v)
         if self.quiet then return end
-        local L = Engine.Legal(match)
+        local L = legal()
         if not (L and L.minTo) then return end
         amount = clampAmount(L, floor(v + 0.5))
         bar.input:SetText(tostring(amount))
@@ -738,7 +908,7 @@ local function buildBar(f)
     for i = #presets, 1, -1 do
         local p = presets[i]
         local b = Kit.Button(sizing, p[1], 42, 24, function()
-            local L = Engine.Legal(match)
+            local L = legal()
             if not (L and L.minTo) then return end
             amount = presetAmount(L, p[2])
             sl.quiet = true
@@ -756,16 +926,9 @@ local function buildBar(f)
     bar.wait:SetPoint("BOTTOMRIGHT", -16, 20)
 end
 
-local function setEnabled(b, on)
-    if b:IsEnabled() ~= on then
-        if on then b:Enable() else b:Disable() end
-        if b.Paint then b:Paint() end
-    end
-end
-
 function PK.PaintRaise()
     local bar = win and win.bar
-    local L = match and myTurn() and Engine.Legal(match)
+    local L = myTurn() and legal()
     if not (bar and L and L.minTo) then return end
     local a = clampAmount(L, amount)
     local word = a == L.allinTo and "All-in" or (L.bet and "Bet" or "Raise to")
@@ -797,29 +960,17 @@ local function build()
     f.gameInfo = Kit.Text(t, 11, SOFT, "RIGHT")
     f.gameInfo:SetPoint("TOPRIGHT", -12, -10)
 
-    -- seats: index 1 is the top of the table (them), 2 the bottom (you)
-    f.cards, f.plates, f.bets = {}, {}, {}
-    for side = 1, 2 do
-        local row = CreateFrame("Frame", nil, t)
-        row:SetSize(212, 80)
-        if side == 1 then row:SetPoint("TOP", 40, -14) else row:SetPoint("BOTTOM", 40, 14) end
-        f.cards[side] = { row = row }
-        for i = 1, 4 do f.cards[side][i] = newCard(row) end
-        local p = newPlate(t)
-        p:SetPoint("RIGHT", row, "LEFT", -18, 0)
-        f.plates[side] = p
-        f.bets[side] = newBet(t)
-    end
+    -- the seats: your own (big cards at the bottom) and up to eight others round the table
+    f.mine = newSeat(t, true)
+    f.others = {}
+    for i = 1, Engine.MAX_SEATS - 1 do f.others[i] = newSeat(t, false) end
     -- your hand so far ("Two pair, Kings and Sevens"), beside your cards while a hand is being bet
     f.myHand = Kit.Text(t, 12, GOLD, "LEFT")
-    f.myHand:SetPoint("LEFT", f.cards[2].row, "RIGHT", 14, 0)
-    f.myHand:SetWidth(150)
-    f.bets[1]:SetPoint("TOP", f.cards[1].row, "BOTTOM", -40, -10)
-    f.bets[2]:SetPoint("BOTTOM", f.cards[2].row, "TOP", -40, 10)
+    f.myHand:SetWidth(170)
 
     f.board = CreateFrame("Frame", nil, t)
     f.board:SetSize(5 * 56 + 4 * 6, 78)
-    f.board:SetPoint("CENTER", 0, 4)
+    f.board:SetPoint("CENTER", 0, 20)
     for i = 1, 5 do
         local c = newCard(f.board)
         c:Fit(56, 78)
@@ -830,7 +981,7 @@ local function build()
     f.pot:SetPoint("BOTTOM", f.board, "TOP", 0, 8)
     f.status = Kit.Text(t, 13, C.white, "CENTER")
     f.status:SetPoint("TOP", f.board, "BOTTOM", 0, -8)
-    f.status:SetWidth(560)
+    f.status:SetWidth(520)
 
     buildBar(f)
     buildLobby(f)
@@ -842,110 +993,174 @@ local function build()
     return f
 end
 
--- lays the hole cards out for 2 (Hold'em) or 4 (Omaha)
-local function layoutCards(k)
-    if win.laidOut == k then return end
-    win.laidOut = k
+-- places every seat for a table of n with you at the bottom, and sizes the cards for k hole cards
+local function layoutSeats(n, k, me)
+    local lkey = n .. ":" .. k .. ":" .. me
+    if win.laidOut == lkey then return end
+    win.laidOut = lkey
+    local t = win.felt
+    -- yours: the plate on the left of big cards
+    local s = win.mine
     local w, h, gap = 58, 80, 6
     if k == 4 then w, h, gap = 50, 70, 4 end
-    for side = 1, 2 do
-        local set = win.cards[side]
-        set.row:SetSize(k * w + (k - 1) * gap, h)
-        for i = 1, 4 do
-            set[i]:Fit(w, h)
-            set[i]:ClearAllPoints()
-            set[i]:SetPoint("LEFT", (i - 1) * (w + gap), 0)
+    local rowW = k * w + (k - 1) * gap
+    s.row:SetParent(t)
+    s.row:ClearAllPoints()
+    s.row:SetSize(rowW, h)
+    s.row:SetPoint("CENTER", t, "CENTER", 0, ME_Y)
+    for i = 1, 4 do
+        s.cards[i]:Fit(w, h)
+        s.cards[i]:ClearAllPoints()
+        s.cards[i]:SetPoint("LEFT", (i - 1) * (w + gap), 0)
+    end
+    s.plate:SetParent(t)
+    s.plate:ClearAllPoints()
+    s.plate:SetPoint("RIGHT", s.row, "LEFT", -10, 0)
+    s.bet:ClearAllPoints()
+    s.bet:SetPoint("BOTTOM", s.row, "TOP", 0, 12)
+    win.myHand:ClearAllPoints()
+    win.myHand:SetPoint("LEFT", s.row, "RIGHT", 12, 0)
+    -- everyone else: smaller cards above the plate; a crowded table gets smaller ones still
+    local cw, ch = 40, 56
+    if n > 4 then cw, ch = 30, 42 end
+    local angles = ANGLES[n] or {}
+    for i, o in ipairs(win.others) do
+        local a = angles[i]
+        o.frame:SetShown(a ~= nil)
+        o.bet:Hide()
+        if a then
+            local x, y = RX * cos(rad(a)), RY * sin(rad(a))
+            o.frame:ClearAllPoints()
+            o.frame:SetSize(150, 50 + ch - 8)
+            o.frame:SetPoint("CENTER", t, "CENTER", x, y)
+            o.plate:ClearAllPoints()
+            o.plate:SetPoint("BOTTOM", o.frame, "BOTTOM", 0, 0)
+            local cg = 3
+            o.row:ClearAllPoints()
+            o.row:SetSize(k * cw + (k - 1) * cg, ch)
+            o.row:SetPoint("BOTTOM", o.plate, "TOP", 0, -8)
+            o.row:SetFrameLevel(o.plate:GetFrameLevel() - 1)
+            for c = 1, 4 do
+                o.cards[c]:Fit(cw, ch)
+                o.cards[c]:ClearAllPoints()
+                o.cards[c]:SetPoint("LEFT", (c - 1) * (cw + cg), 0)
+            end
+            -- the chips go between the seat and the middle of the table
+            o.bet:ClearAllPoints()
+            o.bet:SetPoint("CENTER", t, "CENTER", x * 0.6, y * 0.55)
         end
     end
 end
 
+-- the seat widgets for a seat number (you are always the one at the bottom)
+local function seatWidgets(seat)
+    local g = T.game
+    local n = g.match.seats
+    local p = (seat - g.me) % n
+    if p == 0 then return win.mine end
+    return win.others[p]
+end
+
+local function shortSaid(said)
+    if not said then return nil end
+    local k, amt = said[1], said[2]
+    if said.allin then return "All-in" end
+    if k == "fold" then return "Fold" end
+    if k == "left" then return "Left" end
+    if k == "check" then return "Check" end
+    if k == "call" then return "Call" end
+    if k == "bet" then return "Bet " .. commas(amt) end
+    if k == "raise" then return "Raise " .. commas(amt) end
+    return nil
+end
+
+local function who(seat, me)
+    return seat == me and "You" or paintName(nameAt(seat))
+end
+local function joinNames(seats, me)
+    local parts = {}
+    for i, s in ipairs(seats) do parts[i] = who(s, me) end
+    if #parts <= 1 then return parts[1] or "" end
+    return table.concat(parts, ", ", 1, #parts - 1) .. " and " .. parts[#parts]
+end
 local function statusFor(view, me)
     local r = view.result
     if not r then return nil end
-    local foeName = paintName(session.foe)
-    local function who(seat) return seat == me and "You" or foeName end
-    if r.fold then
-        return ("%s folded. %s %s %s."):format(who(r.fold), who(r.winner), r.winner == me and "win" or "wins", commas(r.pot))
+    if not r.showdown then
+        local w = r.winner
+        if not w or w == 0 then return "" end
+        return ("%s %s %s."):format(who(w, me), w == me and "win" or "wins", commas(r.pot))
     end
-    if r.winner == 0 then
-        return ("Split pot: %s each with %s."):format(commas(r.won[me]), r.names[me])
+    local parts = {}
+    for i, p in ipairs(r.pots or {}) do
+        local ws = p.winners
+        local what = commas(p.amount)
+        if #r.pots > 1 then what = (i == 1 and "the main pot" or "a side pot") .. " (" .. what .. ")" end
+        local hand = r.names[ws[1]] or ""
+        if #ws == 1 then
+            parts[#parts + 1] = ("%s %s %s with %s"):format(who(ws[1], me), ws[1] == me and "win" or "wins", what, hand)
+        else
+            parts[#parts + 1] = ("%s split %s with %s"):format(joinNames(ws, me), what, hand)
+        end
     end
-    return ("%s %s %s with %s."):format(who(r.winner), r.winner == me and "win" or "wins", commas(r.pot), r.names[r.winner])
+    return table.concat(parts, ".  ") .. "."
+end
+
+local function clearTable(f)
+    if f.result:IsOpen() then f.result:Close() end
+    f.mine.plate:Hide()
+    f.mine.row:Hide()
+    f.mine.bet:Hide()
+    for _, o in ipairs(f.others) do
+        o.frame:Hide()
+        o.bet:Hide()
+    end
+    for i = 1, 5 do f.board[i]:Set(nil) end
+    f.pot:SetText("")
+    f.status:SetText("")
+    f.handInfo:SetText("")
+    f.gameInfo:SetText("")
+    f.myHand:SetText("")
+    f.bar:Hide()
 end
 
 paint = function()
     local f = win
     if not f then return end
-    local active = live()
-    f.lobby:SetShown(not active)
-    if not active then
-        if f.result:IsOpen() then f.result:Close() end
+    local g = T.game
+    f.lobby:SetShown(g == nil)
+    if not g then
+        clearTable(f)
         paintLobby()
-        for side = 1, 2 do
-            for i = 1, 4 do f.cards[side][i]:Set(false) end
-            f.plates[side]:Hide()
-            f.plates[side].said:SetText("")
-            f.bets[side]:Hide()
-        end
-        for i = 1, 5 do f.board[i]:Set(nil) end
-        f.pot:SetText("")
-        f.status:SetText("")
-        f.handInfo:SetText("")
-        f.gameInfo:SetText("")
-        f.myHand:SetText("")
-        f.bar:Hide()
         return
     end
     f.bar:Show()
-    local me, foe = mySeat(), 3 - mySeat()
-    local seatOf = { foe, me } -- table side -> seat
-    local h = match.hand
+    f.mine.plate:Show()
+    f.mine.row:Show()
+    local m = g.match
+    local me, N = g.me, m.seats
+    local h = m.hand
     local predeal = h.phase == "commit" or h.phase == "seed" or h.phase == "reveal"
     local view = h
-    if (match.over or predeal) and match.last then view = match.last end
+    if (m.over or predeal) and m.last then view = m.last end
     local showingLast = view ~= h
-    local quit = match.ended == "resign" or match.ended == "leave"
+    local closed = g.ended ~= nil
     -- an all-in board still being played out (a match-ending all-in is both last and current hand)
-    local rolling = running(view) and view.result ~= nil and not quit
-    local k = Engine.Cards(match)
-    layoutCards(k)
+    local rolling = running(view) and view.result ~= nil and not closed
+    local k = Engine.Cards(m)
+    layoutSeats(N, k, me)
 
     local r = view.result
     local dealt = view.phase == "bet" or view.phase == "done"
+    -- the main pot's winning cards glow
     local winSet = {}
-    if r and r.showdown and not rolling then
-        for seat = 1, 2 do
-            if r.winner == 0 or r.winner == seat then
-                for _, c in ipairs(r.best[seat] or {}) do winSet[c] = true end
-            end
+    if r and r.showdown and not rolling and r.pots and r.pots[1] then
+        for _, seat in ipairs(r.pots[1].winners) do
+            for _, c in ipairs(r.best[seat] or {}) do winSet[c] = true end
         end
-    end
-    local function look(c, seat)
-        if r and r.fold == seat then return "dim" end
-        if winSet[c] then return "win" end
-        return nil
     end
 
-    -- hole cards
-    for side = 1, 2 do
-        local seat = seatOf[side]
-        local set = f.cards[side]
-        local faceUp = seat == me or (r and r.showdown)
-        for i = 1, 4 do
-            if i > k then
-                set[i]:Set(false)
-            elseif not dealt then
-                set[i]:Set(nil)
-            else
-                local c = view.holes[seat][i]
-                set[i]:Set(faceUp and c or true, look(c, seat))
-                -- the runout begins: their hand turns over
-                if rolling and run.flipFoe and seat ~= me then set[i]:Land(true) end
-            end
-        end
-    end
-    if rolling then run.flipFoe = false end
-    -- board
+    -- the board
     local shown = dealt and Engine.BoardShown(view) or 0
     if rolling then shown = run.shown end
     for i = 1, 5 do
@@ -959,111 +1174,152 @@ paint = function()
         end
     end
     -- during the runout, each player's hand so far ("Pair of Kings") from the cards face up
-    local ev = match.opts.variant == "PLO" and Eval.Omaha or Eval.Holdem
+    local ev = m.opts.variant == "PLO" and Eval.Omaha or Eval.Holdem
     local upNow = rolling and (run.back and shown - 1 or shown) or 0
     local function soFar(seat)
         if upNow < 3 then return "All-in" end
         local board = {}
         for i = 1, upNow do board[i] = view.board[i] end
         local sc = ev(view.holes[seat], board)
-        return sc and Eval.Name(sc) or "All-in"
+        return sc and kind(Eval.Name(sc)) or "All-in"
     end
-    -- your own hand while the betting is on (the runout and showdown name hands on the plates)
+    -- your own hand while the betting is on
     local mine = ""
-    if not showingLast and not rolling and h.phase == "bet" and h.holes and h.holes[me] then
+    if not showingLast and not rolling and h.phase == "bet" and h.inHand[me] and not h.folded[me] then
         local board = {}
         for i = 1, shown do board[i] = h.board[i] end
-        mine = Eval.Current(h.holes[me], board, match.opts.variant == "PLO")
+        mine = Eval.Current(h.holes[me], board, m.opts.variant == "PLO")
     end
     f.myHand:SetText(mine)
 
-    -- plates, bets and what each player last did
-    local stacks = showingLast and view.endStacks or match.stacks
-    -- the pot isn't pushed until the river is out
-    if rolling then stacks = { view.endStacks[1] - r.won[1], view.endStacks[2] - r.won[2] } end
-    for side = 1, 2 do
-        local seat = seatOf[side]
-        local p = f.plates[side]
-        p:Show()
-        local name = seat == me and short(session.me or FDJ.PlayerName()) or short(session.foe)
-        p.name:SetText("|cff" .. Games.ClassHex(name, true) .. name .. "|r")
-        p.stack:SetText(commas(stacks[seat]))
-        p.button:SetShown(view.button == seat)
-        local tag = ""
-        if rolling and stacks[seat] == 0 then tag = "ALL-IN"
-        elseif not showingLast and stacks[seat] == 0 and not match.over then tag = "ALL-IN"
-        elseif not showingLast then tag = view.button == seat and "SB" or "BB" end
-        p.tag:SetText(tag)
-        p.ring:SetShown(not showingLast and h.phase == "bet" and h.toAct == seat)
-        local said
-        if rolling then
-            said = soFar(seat)
-        elseif r and r.showdown then
-            said = r.names[seat]
-        elseif r and r.fold == seat then
-            said = "Fold"
-        elseif r and r.winner == seat then
-            said = "Wins " .. commas(r.pot)
+    -- the seats
+    local stacks = showingLast and view.endStacks or m.stacks
+    if rolling then
+        -- the pot isn't pushed until the river is out
+        stacks = {}
+        for i = 1, N do stacks[i] = view.endStacks[i] - (r.won[i] or 0) end
+    end
+    for seat = 1, N do
+        local s = seatWidgets(seat)
+        local p = s.plate
+        local name = nameAt(seat)
+        p.name:SetText(paintName(name))
+        p.button:SetShown(view.button == seat and view.inHand[seat])
+        local out = view.startOut[seat]
+        local left = view.left and view.left[seat]
+        local folded = view.folded[seat]
+        local live = view.inHand[seat] and not folded
+        local won = r and not rolling and (r.won[seat] or 0) > 0
+        if out then
+            p.stack:SetText(out == "left" and "Left" or "Out")
+            p.tag:SetText(view.startPlace[seat] and Engine.Ordinal(view.startPlace[seat]) or "")
+            p:SetAlpha(0.4)
         else
-            said = Engine.Said(view.said and view.said[seat])
+            p.stack:SetText(left and "Left" or commas(stacks[seat]))
+            local tag
+            if rolling and live then tag = soFar(seat)
+            elseif r and r.showdown and live then tag = kind(r.names[seat])
+            elseif won and not r.showdown then tag = "Wins " .. commas(r.won[seat])
+            elseif left then tag = "Left"
+            elseif folded then tag = "Fold"
+            else tag = shortSaid(view.said[seat]) end
+            if not tag and not showingLast then
+                if stacks[seat] == 0 and live then tag = "All-in"
+                elseif seat == view.sbSeat then tag = "SB"
+                elseif seat == view.bbSeat then tag = "BB" end
+            end
+            p.tag:SetText(tag or "")
+            p:SetAlpha((folded or left) and 0.55 or 1)
         end
-        p.said:SetText(said or "")
-        local bet = showingLast and 0 or h.bet[seat]
-        local b = f.bets[side]
+        if won then p:Ring(GOLD)
+        elseif not showingLast and h.phase == "bet" and h.toAct == seat then p:Ring(GREEN)
+        else p:Ring(nil) end
+
+        -- hole cards: yours face up; everyone still in at a showdown (or an all-in runout) face up too
+        local faceUp = seat == me or (r and r.showdown and live)
+        for i = 1, 4 do
+            local card = s.cards[i]
+            if i > k or out or not view.inHand[seat] then
+                card:Set(false)
+            elseif not dealt then
+                card:Set(nil)
+            elseif folded and seat ~= me then
+                card:Set(false)
+            else
+                local c = view.holes[seat][i]
+                local look = folded and "dim" or (winSet[c] and "win" or nil)
+                card:Set(faceUp and c or true, look)
+                -- the runout begins: their hands turn over
+                if rolling and run.flip and seat ~= me and live then card:Land(true) end
+            end
+        end
+
+        local bet = (showingLast or out) and 0 or h.bet[seat]
         if bet > 0 then
-            b.text:SetText(commas(bet))
-            b:SetWidth(max(56, b.text:GetStringWidth() + 20))
-            b:Show()
+            s.bet.text:SetText(commas(bet))
+            s.bet:SetWidth(max(56, s.bet.text:GetStringWidth() + 20))
+            s.bet:Show()
         else
-            b:Hide()
+            s.bet:Hide()
         end
     end
+    if rolling then run.flip = false end
 
-    local potNow = showingLast and (r and r.pot or 0) or (h.pot + h.bet[1] + h.bet[2])
+    local potNow = showingLast and (r and r.pot or 0) or Engine.Pot(m)
     f.pot:SetText(potNow > 0 and ("Pot " .. commas(potNow)) or "")
 
-    local o = match.opts
-    f.gameInfo:SetText(Engine.VARIANTS[o.variant])
-    local left = Engine.HandsToLevel(o, h.n)
+    local o = m.opts
+    local players = 0
+    for i = 1, N do if not m.out[i] then players = players + 1 end end
+    f.gameInfo:SetText(("%s  ·  %d of %d left"):format(Engine.VARIANTS[o.variant], players, N))
+    local togo = Engine.HandsToLevel(o, h.n)
     f.handInfo:SetText(("Hand %d  ·  Blinds %s / %s%s"):format(h.n, commas(h.sb), commas(h.bb),
-        left and ("  ·  up in %d"):format(left) or ""))
+        togo and ("  ·  up in %d"):format(togo) or ""))
 
     -- the line under the board
+    local out = iAmOut()
     local status
     if rolling then
         if upNow < 3 then status = "|cffffd24dAll-in!|r  Here comes the flop..."
         elseif upNow == 3 then status = "The turn..."
         elseif upNow == 4 then status = "|cffffd24dThe river...|r"
         else status = "" end
-    elseif match.over then
-        local won = match.winner == me
-        if quit then
-            status = won and (paintName(session.foe) .. (match.ended == "resign" and " gave up." or " left.")) or "You gave up."
-        else
-            status = statusFor(view, me) or ""
-        end
+    elseif g.ended == "closed" then
+        status = paintName(g.host) .. " closed the table."
+    elseif m.over then
+        local base = statusFor(view, me)
+        status = base and base ~= "" and base or (who(m.winner, me) .. (m.winner == me and " win the table!" or " wins the table!"))
     elseif showingLast then
         status = statusFor(view, me)
     elseif predeal then
         status = "Shuffling..."
     end
     if not status and myTurn() then
-        local L0 = Engine.Legal(match)
+        local L0 = legal()
         status = "|cff66dd88Your turn|r" .. (L0 and L0.toCall > 0 and ("  ·  " .. commas(L0.call) .. " to call") or "")
     end
-    if not status and match.cheat then status = "|cffff6b6bThe deal didn't check out.|r" end
+    if not status and m.cheat then status = "|cffff6b6bThe deal didn't check out.|r" end
     f.status:SetText(status or "")
 
     -- the action bar
     local bar = f.bar
-    local L = myTurn() and Engine.Legal(match)
-    local over = match.over or session.over
-    bar.giveUp:SetLabel(over and "Menu" or "Give up")
+    local over = T.Over(g)
+    local L = myTurn() and legal()
+    bar.giveUp:SetLabel((over or out) and "Menu" or "Leave")
     bar.giveUp:SetWidth(96)
+    -- the host's way out of a player who stopped answering
+    local stuck = not over and T.IsHost() and Engine.Expect(m)
+    if stuck and stuck ~= me and GetTime() - (g.movedAt or GetTime()) > 60 then
+        bar.remove:SetLabel("Remove " .. short(nameAt(stuck)))
+        bar.remove:SetWidth(150)
+        bar.remove:Show()
+    else
+        bar.remove:Hide()
+    end
     if L then
-        local key = decisionKey()
-        if amountKey ~= key then
-            amountKey = key
+        local dkey = decisionKey()
+        if amountKey ~= dkey then
+            amountKey = dkey
             amount = L.minTo
         end
         bar.wait:Hide()
@@ -1103,29 +1359,44 @@ paint = function()
         bar.wait:Show()
         local text = ""
         if over then
-            text = PK.note or (session.gone and (short(session.foe) .. " has left.") or "")
+            text = PK.note or ""
+        elseif out then
+            text = ("You finished %s. Watching the rest..."):format(Engine.Ordinal(m.place[me] or N))
+        elseif g.pending then
+            text = "Sending..."
         elseif rolling then
             text = "Running it out..."
         elseif predeal then
             text = "Dealing..."
         else
-            text = "Waiting for " .. paintName(session.foe) .. "..."
+            local seat = Engine.Expect(m)
+            text = seat and ("Waiting for " .. paintName(nameAt(seat)) .. "...") or ""
         end
         bar.wait:SetText(text)
     end
 
-    -- the end of the match (after the last runout has been played out)
-    if over and f.resultFor ~= session.id and not rolling then
-        f.resultFor = session.id
-        local won = match.winner == me
-        f.result:Open({
-            title = won and "You win the match!" or "You lost the match",
-            tone = won and "win" or "lose",
-            big = won and "Heads-up champion" or ("vs " .. short(session.foe)),
-            lines = { ("%d hands of %s"):format(h.n, Engine.VARIANTS[o.variant]),
-                won and ("against " .. short(session.foe)) or nil },
-            buttons = { { "Menu", PK.Menu }, { "Rematch", PK.Rematch } },
-        })
+    -- the end of the game for me (after the last runout has been played out)
+    if not rolling and f.resultFor ~= g.id and (m.over or out or closed) then
+        f.resultFor = g.id
+        local won = m.winner == me
+        local place = m.place[me]
+        local lines = { ("%d hands of %s"):format(view.n, Engine.VARIANTS[o.variant]), ("%d players"):format(N) }
+        if closed and not m.over then
+            f.result:Open({ title = "The table closed", tone = "lose", big = "", lines = { paintName(g.host) .. " left." },
+                buttons = { { "Menu", PK.Menu }, { "New table", PK.NewTable } } })
+        elseif won then
+            f.result:Open({ title = "You win the table!", tone = "win", big = "Champion", lines = lines,
+                buttons = { { "Menu", PK.Menu }, { "New table", PK.NewTable } } })
+        elseif m.over then
+            f.result:Open({ title = ("You finished %s"):format(Engine.Ordinal(place or N)), tone = "lose",
+                big = Engine.Ordinal(place or N) .. " of " .. N, lines = lines,
+                buttons = { { "Menu", PK.Menu }, { "New table", PK.NewTable } } })
+        else
+            -- out, but the others play on
+            f.result:Open({ title = ("You finished %s"):format(Engine.Ordinal(place or N)), tone = "lose",
+                big = Engine.Ordinal(place or N) .. " of " .. N, lines = lines,
+                buttons = { { "Watch", function() end }, { "Leave", PK.Menu } } })
+        end
     end
 end
 
@@ -1152,20 +1423,26 @@ local function drawTile(t, size)
 end
 
 Games.Register({
-    key = KEY, name = LABEL, category = "party", order = 40, players = "2",
-    desc = "No-Limit Hold'em or Pot-Limit Omaha, one on one.",
+    key = KEY, name = LABEL, category = "party", order = 40, players = "2-9",
+    desc = "No-Limit Hold'em or Pot-Limit Omaha for 2 to 9 friends.",
     icon = "Interface\\Icons\\INV_Misc_Coin_02", draw = drawTile, theme = KEY,
     slash = { "poker", "holdem", "plo" },
+    -- /fc poker opens the window; /fc poker <name> invites them to your table
     open = function(arg)
         PK.Show()
         arg = trim(arg)
-        if arg ~= "" and not D:Active() and win and win.lobby then win.lobby.name:SetText(arg) end
+        if arg ~= "" and not playing() then PK.Invite(arg) end
     end,
     isOpen = function() return win ~= nil and win:IsShown() end,
     status = function()
+        local g = T.game
         if playing() then
-            return { stat = "vs " .. short(session.foe), badge = myTurn() and "turn" or "live" }
+            local left = 0
+            for i = 1, g.match.seats do if not g.match.out[i] then left = left + 1 end end
+            return { stat = ("%d players"):format(left), badge = myTurn() and "turn" or "live" }
         end
+        if T.lobby then return { stat = ("Table: %d seated"):format(#T.lobby.players), badge = "live" } end
+        if T.LatestOffer() then return { stat = "Invited", badge = "turn" } end
         local d = db()
         if d.w + d.l > 0 then return { stat = ("Won %d of %d"):format(d.w, d.w + d.l) } end
         return nil
@@ -1173,5 +1450,5 @@ Games.Register({
 })
 
 -- test hooks
-function PK._state() return match, session end
+function PK._state() return T.game, T.lobby end
 function PK._win() return win end
