@@ -207,21 +207,33 @@ do
     check(hg.match.out[dSeat] == "left" or (hg.match.hand.left and hg.match.hand.left[dSeat]), "the host sees Dain leave")
     check(dain.env.FojjiCorePokerDB.l == 1, "walking out counts as a loss")
     check(state(dain) == nil, "Dain is back at the menu")
-    -- Cara's game crashes and she never comes back: play until the table waits on her, then wait it out
+    -- Cara's game crashes and she never comes back: her clock runs out each time it's her turn, and
+    -- after twice in a row (or the deal waiting on her for a minute) the host can remove her
     local cara = client(world, 3)
     local cSeat
     for i, n in ipairs(hg.names) do if n == "Cara" then cSeat = i end end
     cara.dead = true
-    local removed = false
+    local removed, timedOut = false, 0
     play(world, "removal", function(_, w)
         local host = client(w, 1)
         local g = state(host)
         if removed or not g or g.match.over or g.match.out[cSeat] then return end
-        if host.ns.Engine.Expect(g.match) == cSeat then
+        local E = host.ns.Engine
+        local who, kind = E.Expect(g.match)
+        if who ~= cSeat then return end
+        if kind == "A" then
+            local turn = E.TurnKey(g.match)
+            w:Run(E.SHOT_CLOCK + 3)
+            check(E.TurnKey(g.match) ~= turn, "the host times Cara out when her clock runs out")
+            timedOut = timedOut + 1
+        else
             w:Run(65)
-            host.PK.Show()
-            local bar = host.PK._win().bar
-            check(bar.remove:IsShown(), "after a minute the host can remove Cara")
+        end
+        host.PK.Show()
+        local bar = host.PK._win().bar
+        if bar.remove:IsShown() then
+            check(bar.remove.seat == cSeat, "the Remove button is for Cara")
+            check(timedOut >= 2 or kind ~= "A", "Remove shows only after Cara ran out of time twice")
             -- the confirm dialog is FojjiCore's; call what it would
             check(host.ns.Table.Remove(cSeat), "the host removes Cara")
             removed = true
@@ -302,6 +314,81 @@ do
     check(not win.lobby.go:IsEnabled(), "the Start button waits for a second player")
     for _, c in ipairs(world.clients) do
         check(#c.reports == 0, "lobby: no errors for " .. c.name .. ": " .. table.concat(c.reports, " | "))
+    end
+end
+
+-- 8. the shot clock and the time bank, heads-up
+do
+    local world = newWorld(2, true)
+    seat(world, 2, { variant = "NL", stackBB = 100, level = 0 })
+    local host, bob = client(world, 1), client(world, 2)
+    local E = host.ns.Engine
+    local SHOT, BANK = E.SHOT_CLOCK, E.TIME_BANK
+    -- runs until it's c's decision; the other player just checks or calls
+    local function waitFor(c)
+        for _ = 1, 400 do
+            if myAction(c) then return true end
+            world:Run(0.5)
+            for _, o in ipairs(world.clients) do
+                if o ~= c and myAction(o) then o.PK._win().bar.call:Click() end
+            end
+        end
+        return false
+    end
+    local function hostBank(c) return state(host).match.bank[state(c).me] end
+    local function agree(label)
+        check(E.Snapshot(state(host).match) == E.Snapshot(state(bob).match), label .. ": both see the same game")
+    end
+
+    -- a: Auto time bank is on: the bank picks up where the shot clock stops
+    check(bob.env.FojjiCorePokerDB.autoBank == true, "Auto time bank starts on")
+    check(waitFor(bob), "a: Bob gets a decision")
+    world:Run(SHOT + 30)
+    check(myAction(bob), "a: 30 seconds into his bank Bob is still thinking")
+    check(state(host).match.hand.banking, "a: the host sees Bob's bank running")
+    local c = bob.ns.Table.Clock()
+    check(c and c.banking and c.shot == 0, "a: Bob's clock shows the bank running")
+    bob.PK._win().bar.call:Click()
+    world:Run(1)
+    local left = hostBank(bob)
+    check(left >= BANK - 32 and left <= BANK - 27, "a: about 30 seconds came off Bob's bank: " .. tostring(left))
+    agree("a")
+
+    -- b: with it off, the shot clock running out is a check or a fold, and the bank is kept
+    bob.PK._win().bar.auto:Click()
+    check(bob.env.FojjiCorePokerDB.autoBank == false, "b: Bob turns Auto time bank off")
+    check(waitFor(bob), "b: Bob gets a decision")
+    local turn = E.TurnKey(state(host).match)
+    world:Run(SHOT + 3)
+    check(E.TurnKey(state(host).match) ~= turn, "b: Bob ran out of time")
+    check(hostBank(bob) == left, "b: his bank wasn't touched")
+    agree("b")
+
+    -- c: with it off, Use time bank starts it by hand, and it runs out too
+    check(waitFor(bob), "c: Bob gets a decision")
+    local bar = bob.PK._win().bar
+    bob.PK.Show()
+    check(bar.useBank:IsShown(), "c: Bob has a Use time bank button")
+    bar.useBank:Click()
+    world:Run(1)
+    check(state(host).match.hand.banking, "c: the host has Bob's bank running")
+    world:Run(SHOT + 10)
+    check(myAction(bob), "c: Bob is still thinking on his bank")
+    world:Run(left)
+    check(hostBank(bob) == 0, "c: Bob's bank ran out")
+    agree("c")
+
+    -- d: the host's own bank starts by itself too
+    check(waitFor(host), "d: the host gets a decision")
+    world:Run(SHOT + 6)
+    check(myAction(host), "d: the host is on their bank")
+    host.PK._win().bar.call:Click()
+    world:Run(1)
+    local hb = hostBank(host)
+    check(hb >= BANK - 7 and hb <= BANK - 5, "d: about 6 seconds came off the host's bank: " .. tostring(hb))
+    agree("d")
+    for _, cl in ipairs(world.clients) do
+        check(#cl.reports == 0, "clock: no errors for " .. cl.name .. ": " .. table.concat(cl.reports, " | "))
     end
 end
 

@@ -14,6 +14,13 @@
 --   T.cb.onClosed(text)        the lobby we were in went away
 --   T.cb.onTick()              every few seconds while a game is going
 --   T.cb.options()             the options a new table starts with
+--   T.cb.autoBank()            true when my time bank should start by itself once my shot clock runs out
+--
+-- The clock: every decision gets Engine.SHOT_CLOCK seconds, then the player's time bank if they have
+-- started on it (move W: sent by itself near the end of the shot clock when autoBank() says so, or by
+-- the player's "Time bank" button). Only the host keeps time. When it takes a move from a player who
+-- ran into their bank it first sends U (the seconds used), and when a player runs out it sends T (they
+-- check or fold).
 --
 -- On the wire (kind "PKT", every message "sub~id~..."):
 --   I~id~opts   invite (host -> player)          J~id   join (player -> host)     D~id   no thanks
@@ -36,6 +43,10 @@ local KIND = "PKT"
 local MAX = Engine.MAX_SEATS
 local INVITE_TIME = 90
 local RESUME_TIME = 30 * 60
+local SHOT = Engine.SHOT_CLOCK
+local LAG = 1     -- seconds a move from another player may spend on its way to the host (not charged)
+local GRACE = 2   -- seconds past the clock the host waits on another player before timing them out
+local EARLY = 3   -- my time bank starts this long before my shot clock runs out, so the host has it in time
 local GROUP = { PARTY = true, RAID = true, INSTANCE_CHAT = true }
 local same, key = Games.Same, Games.Key
 
@@ -43,6 +54,7 @@ local function me() return Games.Wire(FDJ.PlayerName()) end
 local function short(n) return n and Games.Name(n) or "?" end
 local function trim(s) return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", "")) end
 local function newId() return tostring(math.random(100000, 999999)) end
+local floor, max = math.floor, math.max
 local function call(name, ...)
     local fn = T.cb[name]
     if not fn then return end
@@ -111,8 +123,10 @@ end
 -- ---------------------------------------------------------------- state
 -- T.lobby: { id, host, players = { names }, opts, invited = { [key] = name }, joining, heardAt }
 -- T.game:  { id, host, names = { seat -> name }, opts, match, n (moves so far), me (my seat),
---            pending = { n, text, at, tries } (my move on its way to the host), ended ("closed" / "left"),
---            heardAt, movedAt, away = { [key] = true } (left: no more messages for them) }
+--            pending = { n, text, at, tries, turn } (my move on its way to the host), ended ("closed" / "left"),
+--            heardAt, movedAt, away = { [key] = true } (left: no more messages for them),
+--            turnKey, turnAt (the decision being made and when it started, on this client's clock),
+--            timeouts = { [seat] = n } (the host: times in a row that seat ran out of time) }
 function T.Over(g)
     g = g or T.game
     return not g or g.ended ~= nil or g.match.over == true
@@ -129,6 +143,18 @@ local function save()
     if not g or T.Over(g) then d.live = nil return end
     d.live = { id = g.id, host = g.host, names = table.concat(g.names, ","), opts = g.opts, n = g.n,
         snap = Engine.Snapshot(g.match), t = time() }
+end
+
+-- a new decision starts the clock again
+local function markTurn(g)
+    local k = Engine.TurnKey(g.match)
+    if k ~= g.turnKey or not g.turnAt then g.turnKey, g.turnAt = k, GetTime() end
+end
+-- my move is still waiting on the host: nothing has happened at the table but the clock and people
+-- leaving, and it's still my decision
+local function stillPending(g)
+    local p = g.pending
+    return p ~= nil and p.turn ~= nil and Engine.TurnKey(g.match) == p.turn
 end
 
 local function stateFor(g)
@@ -154,8 +180,9 @@ local function adopt(id, host, n, opts, namesText, snap)
         T.game, T.lobby = g, nil
     end
     g.match, g.n = m, n
-    if g.pending and g.pending.n < n then g.pending = nil end
+    if g.pending and g.pending.n < n and not stillPending(g) then g.pending = nil end
     g.heardAt, g.movedAt = GetTime(), GetTime()
+    markTurn(g)
     save()
     call("onChange", fresh and "start" or "sync")
     return true
@@ -174,15 +201,58 @@ local function askHost(soon)
 end
 
 -- the host: one move into the game, numbered, and out to the table
-local function hostApply(seat, text)
+local function publish(seat, text)
     local g = T.game
     local ok, err = Engine.Apply(g.match, seat, text)
     if not ok then return false, err end
     g.n = g.n + 1
     g.movedAt = GetTime()
+    markTurn(g)
     save()
     broadcast(g.names, pack("M", g.id, g.n, seat, text), g.away)
     call("onChange", seat == g.me and "me" or "foe", text)
+    return true
+end
+
+-- the host: a move from a player (or the table), with any time bank they used charged just before it
+local function hostApply(seat, text)
+    local g = T.game
+    local m = g.match
+    local h = m.hand
+    g.timeouts = g.timeouts or {}
+    if seat > 0 and text ~= "W" and h.banking and h.toAct == seat and g.turnAt then
+        local used = floor(GetTime() - g.turnAt - SHOT - (seat == g.me and 0 or LAG))
+        used = math.min(used, m.bank[seat] or 0)
+        if used > 0 then
+            -- only charge for a move that will go through
+            local probe = Engine.FromSnapshot(Engine.Snapshot(m), g.id)
+            local ok, err = probe and Engine.Apply(probe, seat, text)
+            if not ok then return false, err or "lost track of the game" end
+            publish(0, "U" .. seat .. used)
+        end
+    end
+    local ok, err = publish(seat, text)
+    if not ok then return false, err end
+    local s = seat == 0 and tonumber(text:match("^T(%d)$"))
+    if s then
+        g.timeouts[s] = (g.timeouts[s] or 0) + 1
+    elseif seat > 0 and text ~= "W" then
+        g.timeouts[seat] = 0
+    end
+    return true
+end
+T.Timeouts = function(seat) return T.game and T.game.timeouts and T.game.timeouts[seat] or 0 end
+
+-- the host: everything since move n (a move sent before the sender heard about these) is only the
+-- clock or people leaving, so a move made after n still stands
+local function onlyClockSince(g, n)
+    local k = g.n - n
+    local log = g.match.hand.log
+    if k < 1 or k > #log then return false end
+    for i = #log - k + 1, #log do
+        local c = log[i]:sub(1, 1)
+        if not (c == "W" or c == "U" or c == "O") then return false end
+    end
     return true
 end
 
@@ -301,7 +371,7 @@ function T.Start()
     end
     local m = Engine.NewMatch(L.opts, L.id, #names)
     local g = { id = L.id, host = L.host, names = names, opts = m.optsText, match = m, n = 0,
-        me = seatOf(names, me()), away = {}, movedAt = GetTime(), heardAt = GetTime() }
+        me = seatOf(names, me()), away = {}, movedAt = GetTime(), heardAt = GetTime(), timeouts = {} }
     T.game, T.lobby = g, nil
     save()
     broadcast(names, stateFor(g))
@@ -348,10 +418,44 @@ function T.Act(text)
     if not probe then return false, "lost track of the game" end
     local ok, err = Engine.Apply(probe, g.me, text)
     if not ok then return false, err end
-    g.pending = { n = g.n, text = text, at = GetTime(), tries = 1 }
+    g.pending = { n = g.n, text = text, at = GetTime(), tries = 1, turn = Engine.TurnKey(g.match) }
     whisper(g.host, pack("A", g.id, g.n, text))
     call("onChange", "pending")
     return true
+end
+
+-- starts my time bank for this decision. Not a pending move: the buttons stay up, and the host takes
+-- a move I make before I hear back (see onlyClockSince). Sent again now and then until it's in.
+function T.UseBank()
+    local g = T.game
+    if not T.Playing() or g.pending then return false end
+    local m = g.match
+    local who, k = Engine.Expect(m)
+    if who ~= g.me or k ~= "A" or m.hand.banking or (m.bank[g.me] or 0) <= 0 then return false end
+    if T.IsHost() then return hostApply(g.me, "W") end
+    local key = Engine.TurnKey(m)
+    if g.bankKey == key and GetTime() - (g.bankAt or 0) < 2 then return true end
+    g.bankKey, g.bankAt = key, GetTime()
+    whisper(g.host, pack("A", g.id, g.n, "W"))
+    return true
+end
+
+-- the clock on the decision being made, for the window:
+--   { seat, shot = seconds left on the shot clock, bank = seconds left on the bank,
+--     armed = the bank will run when the shot clock is out, banking = the bank is running now }
+function T.Clock()
+    local g = T.game
+    if not T.Playing() then return nil end
+    local m = g.match
+    if not Engine.TurnKey(m) then return nil end
+    markTurn(g)
+    local h = m.hand
+    local elapsed = GetTime() - g.turnAt
+    local over = max(0, elapsed - SHOT)
+    local bank = m.bank[h.toAct] or 0
+    if h.banking then bank = max(0, bank - over) end
+    return { seat = h.toAct, shot = max(0, SHOT - elapsed), bank = bank, armed = h.banking == true,
+        banking = h.banking == true and over > 0 }
 end
 
 -- the host: takes a player who stopped answering out of the game
@@ -489,7 +593,8 @@ handlers.M = function(id, rest, who)
         if not ok then askHost(true) return end
         g.n = n
         g.movedAt = GetTime()
-        if g.pending and g.pending.n < n then g.pending = nil end
+        markTurn(g)
+        if g.pending and g.pending.n < n and not stillPending(g) then g.pending = nil end
         save()
         call("onChange", seat == g.me and "me" or "foe", text)
     elseif n > g.n + 1 then
@@ -504,13 +609,15 @@ handlers.A = function(id, rest, who)
     local n, text = rest:match("^(%d+)~(.*)$")
     n = tonumber(n)
     if not (seat and n) then return end
-    if n ~= g.n then
+    local wait = text == "W"
+    if n ~= g.n and not (n < g.n and onlyClockSince(g, n) and Engine.Expect(g.match) == seat) then
         -- they missed something (or this is a copy of a move we already have): catch them up
-        if n < g.n then whisper(who, stateFor(g)) end
+        if n < g.n and not wait then whisper(who, stateFor(g)) end
         return
     end
     if Engine.Expect(g.match) ~= seat then return end
-    if not hostApply(seat, text) then whisper(who, stateFor(g)) end
+    -- a time bank that's already running (a copy sent again) needs no answer
+    if not hostApply(seat, text) and not wait then whisper(who, stateFor(g)) end
 end
 
 handlers.P = function(id, rest, who)
@@ -586,6 +693,30 @@ local function tick()
     end
 end
 C_Timer.After(4, tick)
+
+-- ---------------------------------------------------------------- the clock
+-- Twice a second while a hand is being bet: start my time bank when my shot clock is nearly out (if
+-- I want it to start by itself), and, for the host, time out whoever has run out of time.
+local function clock()
+    C_Timer.After(0.5, clock)
+    local g = T.game
+    if not g or T.Over(g) then return end
+    local m = g.match
+    if not Engine.TurnKey(m) then return end
+    markTurn(g)
+    local h = m.hand
+    local seat = h.toAct
+    local elapsed = GetTime() - g.turnAt
+    if seat == g.me and not h.banking and not g.pending and (m.bank[seat] or 0) > 0
+        and elapsed >= SHOT - EARLY and T.cb.autoBank and T.cb.autoBank() then
+        T.UseBank()
+    end
+    if T.IsHost() then
+        local limit = SHOT + (h.banking and m.bank[seat] or 0) + (seat == g.me and 0 or GRACE)
+        if elapsed >= limit then hostApply(0, "T" .. seat) end
+    end
+end
+C_Timer.After(0.5, clock)
 
 -- ---------------------------------------------------------------- after a reload or a logout
 FDJ:On("PLAYER_LOGIN", function()

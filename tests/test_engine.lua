@@ -374,6 +374,63 @@ do -- everyone else leaves: the one still sitting wins
     check(back and back.over and back.winner == 3 and back.place[1] == 3, "a finished match comes back from a snapshot")
 end
 
+do -- the shot clock and the time bank
+    local m = Engine.NewMatch("NL,100,0", "clock", 3)
+    for i = 1, 3 do eq(m.bank[i], Engine.TIME_BANK, "everyone starts with a full time bank") end
+    check(not Engine.TurnKey(m), "no clock while the cards are being dealt")
+    deal(m, "c1", 11)
+    local h = m.hand
+    local first = h.toAct
+    local key = Engine.TurnKey(m)
+    check(key ~= nil, "a clock once someone has to act")
+    check(not Engine.Apply(m, 0, "U" .. first .. "10"), "no charge before the bank is started")
+    check(not Engine.Apply(m, first == 1 and 2 or 1, "W"), "only the player to act can start a bank")
+    act(m, first, "W")
+    check(h.banking, "the bank is running")
+    eq(h.toAct, first, "starting the bank doesn't pass the turn")
+    eq(Engine.TurnKey(m), key, "or restart the clock")
+    check(not Engine.Apply(m, first, "W"), "a bank can only be started once a decision")
+    act(m, 0, "U" .. first .. "30")
+    eq(m.bank[first], Engine.TIME_BANK - 30, "30 seconds come off the bank")
+    act(m, first, "C")
+    check(Engine.TurnKey(m) ~= key, "the next decision gets a fresh clock")
+    check(not h.banking, "and no bank running")
+    -- running out of time with a bet to face: a fold, and a running bank is gone
+    local second = h.toAct
+    act(m, second, "W")
+    act(m, 0, "T" .. second)
+    check(h.folded[second], "running out of time facing a bet folds")
+    check(h.said[second].timeout, "marked as out of time")
+    eq(m.bank[second], 0, "the bank that was running is used up")
+    eq(Engine.Said(h.said[second]), "Fold (out of time)", "the history says so")
+    check(not Engine.Apply(m, second, "W"), "a player who isn't to act can't start a bank")
+    -- the big blind's option: out of time is a check, and without a bank running the bank stays
+    local bb = h.toAct
+    eq(bb, h.bbSeat, "the big blind is left with the option")
+    local had = m.bank[bb]
+    act(m, 0, "T" .. bb)
+    check(not h.folded[bb] and h.street == 1, "out of time with nothing to call checks, and the flop comes")
+    eq(m.bank[bb], had, "a bank that wasn't running is kept")
+    check(not Engine.Apply(m, 0, "T" .. second), "only the player to act can run out of time")
+    -- banks carry on to the next hand, and through a snapshot
+    local back = Engine.FromSnapshot(Engine.Snapshot(m), m.salt)
+    check(back and Engine.Snapshot(back) == Engine.Snapshot(m), "a snapshot with clock moves comes back the same")
+    eq(back and back.bank[first], Engine.TIME_BANK - 30, "the bank comes back from a snapshot")
+    eq(back and back.bank[second], 0, "an empty bank comes back empty")
+    while m.hand == h and not m.over do
+        local L = Engine.Legal(m)
+        act(m, h.toAct, L.check and "X" or "F")
+    end
+    check(m.hand ~= h, "on to the next hand")
+    eq(m.bank[first], Engine.TIME_BANK - 30, "the bank lasts the whole game")
+    eq(m.hand.startBank[second], 0, "the next hand starts from what's left")
+    deal(m, "c2", 12)
+    local p = m.hand.toAct
+    if m.bank[p] == 0 then check(not Engine.Apply(m, p, "W"), "no bank left, no bank to start") end
+    back = Engine.FromSnapshot(Engine.Snapshot(m), m.salt)
+    check(back and Engine.Snapshot(back) == Engine.Snapshot(m), "the next hand's banks survive a snapshot")
+end
+
 -- ---------------------------------------------------------------- random matches on two clients
 local rnd = 12345
 local function rand(n)
@@ -406,6 +463,13 @@ for game = 1, 1000 do
         if rand(400) == 1 then
             -- now and then somebody leaves (or a stale leave arrives for someone already out)
             seat, msg = 0, "O" .. rand(seats)
+        elseif kind == "A" and rand(40) == 1 then
+            -- the clock: someone runs out of time, starts their bank, or is charged for it
+            seat, msg = 0, "T" .. seat
+        elseif kind == "A" and not a.hand.banking and a.bank[seat] > 0 and rand(15) == 1 then
+            msg = "W"
+        elseif kind == "A" and a.hand.banking and rand(3) == 1 then
+            seat, msg = 0, "U" .. seat .. rand(40)
         elseif kind == "K" then
             a.secret = "s" .. rand(1e6)
             msg = "K" .. Engine.Commit(a.secret, a.salt, a.hand.n)

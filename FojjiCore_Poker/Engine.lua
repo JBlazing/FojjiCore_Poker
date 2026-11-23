@@ -14,7 +14,14 @@
 --   R<text>  the big blind reveals the secret: the deck is now shuffled from both
 --   Z        the big blind lost its secret (a crash): commit again
 --   F  X  C  B<to>   fold, check, call, bet or raise to <to> (this street's total)
+--   W        the player to act starts on their time bank (the turn doesn't change)
 --   O<seat>  (from seat 0, the host) that player left the table: they fold, and their chips leave too
+--   U<seat><secs>  (from seat 0, the host) the player to act used this many seconds of their time bank
+--   T<seat>  (from seat 0, the host) the player to act ran out of time: they check if they can, else fold
+--
+-- The clock: each decision has a shot clock of SHOT_CLOCK seconds. After that, a player who has
+-- started on their time bank (W) gets whatever is left of it; the bank lasts the whole game. Only the
+-- host keeps time (Table.lua): it charges the bank (U) and times players out (T), so everyone agrees.
 --
 -- The shuffle can't be steered by either dealer: the secret is fixed (committed) before the other
 -- number is known, and the other number is chosen without knowing the secret. It is not a hidden
@@ -30,6 +37,8 @@ local floor, min, max = math.floor, math.min, math.max
 
 Engine.UNIT = 20 -- the first big blind; stacks are counted in these
 Engine.MAX_SEATS = 9
+Engine.SHOT_CLOCK = 24  -- seconds for each decision
+Engine.TIME_BANK = 120  -- extra seconds each player has for the whole game
 local LEVELS = { 20, 30, 40, 60, 80, 100, 150, 200, 300, 400, 600, 800, 1000, 1500, 2000, 3000, 4000,
     6000, 8000, 10000, 15000, 20000, 30000, 40000, 60000, 80000, 100000 }
 Engine.VARIANTS = { NL = "No-Limit Hold'em", PLO = "Pot-Limit Omaha" }
@@ -159,15 +168,21 @@ local function pickDealers(m, h)
     h.answerer = h.committer and atOrAfter(m, h.button, function(i) return here(i) and i ~= h.committer end)
 end
 
--- out[i]: nil while seat i is playing, "bust" or "left" once it isn't; place[i]: where it finished
-function Engine.StartHand(m, n, stacks, button, out, place)
+-- out[i]: nil while seat i is playing, "bust" or "left" once it isn't; place[i]: where it finished;
+-- bank[i]: seconds of time bank left (a full bank when nil)
+function Engine.StartHand(m, n, stacks, button, out, place, bank)
     local N = m.seats
     m.stacks = copy(stacks, N)
     m.out = copy(out or {}, N)
     m.place = copy(place or {}, N)
+    m.bank = {}
+    for i = 1, N do
+        m.bank[i] = max(0, min(Engine.TIME_BANK, floor(tonumber(bank and bank[i]) or Engine.TIME_BANK)))
+    end
     local sb, bb = Engine.Blinds(m.opts, n)
     local h = { n = n, button = button, sb = sb, bb = bb, phase = "commit", log = {},
         startStacks = copy(stacks, N), startOut = copy(m.out, N), startPlace = copy(m.place, N),
+        startBank = copy(m.bank, N), turn = 0,
         bet = {}, total = {}, acted = {}, actedAt = {}, folded = {}, inHand = {}, holes = {}, said = {},
         pot = 0, street = 0, lastRaise = bb, raises = 0, board = {} }
     local players = 0
@@ -279,7 +294,7 @@ local function finishHand(m, h, result)
         return
     end
     local btn = after(m, h.button, function(i) return not m.out[i] end)
-    Engine.StartHand(m, h.n + 1, m.stacks, btn, m.out, m.place)
+    Engine.StartHand(m, h.n + 1, m.stacks, btn, m.out, m.place, m.bank)
 end
 
 -- everyone else folded (or left): the last one standing takes every chip in the middle
@@ -409,7 +424,19 @@ end
 begin = function(m, h, from)
     if countLive(m, h) <= 1 then return winByFold(m, h, h.last and h.last.seat) end
     local i = after(m, from, function(s) return needs(m, h, s) end)
-    if i then h.toAct = i else endStreet(m, h) end
+    if i then
+        -- a new decision: a fresh shot clock, and no time bank running yet
+        h.toAct, h.turn, h.banking = i, h.turn + 1, nil
+    else
+        endStreet(m, h)
+    end
+end
+
+-- an id for the decision being made; it changes whenever a new one starts (and the clock restarts)
+function Engine.TurnKey(m)
+    local h = m.hand
+    if m.over or h.phase ~= "bet" or not h.toAct then return nil end
+    return h.n .. ":" .. h.turn
 end
 
 -- What the player to act may do:
@@ -445,10 +472,16 @@ function Engine.Legal(m)
     return L
 end
 
-local function bettingAction(m, h, seat, msg)
+local function bettingAction(m, h, seat, msg, timedOut)
     local L = Engine.Legal(m)
     if not L or L.seat ~= seat then return false, "not your turn" end
     local kind = msg:sub(1, 1)
+    if msg == "W" then
+        if h.banking then return false, "already on the time bank" end
+        if (m.bank[seat] or 0) <= 0 then return false, "no time bank left" end
+        h.banking = true
+        return true
+    end
     if kind == "F" then
         if not L.fold then return false, "nothing to fold to" end
         h.folded[seat] = true
@@ -473,6 +506,7 @@ local function bettingAction(m, h, seat, msg)
     else
         return false, "unknown action"
     end
+    if timedOut and h.said[seat] then h.said[seat].timeout = true end
     h.acted[seat] = true
     h.actedAt[seat] = h.raises
     h.last = { seat = seat, kind = kind }
@@ -516,6 +550,34 @@ local function leave(m, h, s)
     return true
 end
 
+-- the host charges the player to act for time they took from their bank: "U<seat><secs>"
+local function useBank(m, h, msg)
+    local s, secs = msg:match("^U(%d)(%d+)$")
+    s, secs = tonumber(s), tonumber(secs)
+    if not (s and secs and secs > 0) then return false, "bad time bank message" end
+    if h.phase ~= "bet" or h.toAct ~= s or not h.banking then return false, "not on the time bank" end
+    m.bank[s] = max(0, m.bank[s] - secs)
+    return true
+end
+
+-- the player to act ran out of time: a check if that's free, otherwise a fold. A bank that was
+-- running is all used up.
+local function timeOut(m, h, msg)
+    local s = tonumber(msg:match("^T(%d)$"))
+    if not s then return false, "bad time out" end
+    if h.phase ~= "bet" or h.toAct ~= s then return false, "not their turn" end
+    -- the bank goes first: the fold can end the hand, and the next one starts from these banks
+    local had = m.bank[s]
+    if h.banking then m.bank[s] = 0 end
+    local L = Engine.Legal(m)
+    local ok, err = bettingAction(m, h, s, L and L.check and "X" or "F", true)
+    if not ok then
+        m.bank[s] = had
+        return false, err
+    end
+    return true
+end
+
 -- Applies one message from a seat (0 for the host's own messages). Returns true, or false and why
 -- (the state is then unchanged).
 function Engine.Apply(m, seat, msg)
@@ -524,9 +586,18 @@ function Engine.Apply(m, seat, msg)
     local h = m.hand
     local kind = msg:sub(1, 1)
     if seat == 0 then
-        local s = tonumber(msg:match("^O(%d)$"))
-        if not s then return false, "unknown table message" end
-        local ok, err = leave(m, h, s)
+        local ok, err
+        if kind == "O" then
+            local s = tonumber(msg:match("^O(%d)$"))
+            if not s then return false, "unknown table message" end
+            ok, err = leave(m, h, s)
+        elseif kind == "U" then
+            ok, err = useBank(m, h, msg)
+        elseif kind == "T" then
+            ok, err = timeOut(m, h, msg)
+        else
+            return false, "unknown table message"
+        end
         if not ok then return false, err end
         h.log[#h.log + 1] = msg
         return true
@@ -579,7 +650,7 @@ end
 -- Everything needed to rebuild the match: the options, the current hand's start and messages, and
 -- the last finished hand the same way (so its result can still be shown). The secret for a hand
 -- that hasn't been revealed is never in here; only messages already sent are.
---   "P2;opts;seats;<hand>;<last hand>"   with each hand "n;button;stacks;places;msgs"
+--   "P3;opts;seats;<hand>;<last hand>"   with each hand "n;button;stacks;places;banks;msgs"
 -- places: "-" for a seat still playing, "5" for one that went bust in 5th, "L4" for one that left in 4th
 local function seatsText(m, out, place)
     local t = {}
@@ -589,13 +660,16 @@ local function seatsText(m, out, place)
     return table.concat(t, ",")
 end
 local function handText(m, h)
-    if not h then return "0;0;;;" end
-    return ("%d;%d;%s;%s;%s"):format(h.n, h.button, table.concat(h.startStacks, ","),
-        seatsText(m, h.startOut, h.startPlace), table.concat(h.log, ","))
+    if not h then return "0;0;;;;" end
+    return ("%d;%d;%s;%s;%s;%s"):format(h.n, h.button, table.concat(h.startStacks, ","),
+        seatsText(m, h.startOut, h.startPlace), table.concat(h.startBank, ","), table.concat(h.log, ","))
 end
-local function replay(m, n, button, stacksText, seatText, msgs)
-    local stacks, out, place = {}, {}, {}
+local SEAT0 = { O = true, U = true, T = true } -- the host's own messages
+local function replay(m, n, button, stacksText, seatText, bankText, msgs)
+    local stacks, out, place, bank = {}, {}, {}, {}
     for v in stacksText:gmatch("[^,]+") do stacks[#stacks + 1] = tonumber(v) end
+    for v in bankText:gmatch("[^,]+") do bank[#bank + 1] = tonumber(v) end
+    if #bank ~= m.seats then return false end
     local i = 0
     for v in seatText:gmatch("[^,]+") do
         i = i + 1
@@ -606,29 +680,30 @@ local function replay(m, n, button, stacksText, seatText, msgs)
     end
     if #stacks ~= m.seats or i ~= m.seats then return false end
     if not (button >= 1 and button <= m.seats) then return false end
-    Engine.StartHand(m, n, stacks, button, out, place)
+    Engine.StartHand(m, n, stacks, button, out, place, bank)
     for msg in tostring(msgs or ""):gmatch("[^,]+") do
-        local seat = msg:sub(1, 1) == "O" and 0 or Engine.Expect(m)
+        local seat = SEAT0[msg:sub(1, 1)] and 0 or Engine.Expect(m)
         if not seat or not Engine.Apply(m, seat, msg) then return false end
     end
     return true
 end
 function Engine.Snapshot(m)
-    return ("P2;%s;%d;%s;%s"):format(m.optsText, m.seats, handText(m, not m.over and m.hand or nil), handText(m, m.last))
+    return ("P3;%s;%d;%s;%s"):format(m.optsText, m.seats, handText(m, not m.over and m.hand or nil), handText(m, m.last))
 end
 function Engine.FromSnapshot(text, salt)
-    local opts, seats, n, b, s, p, msgs, ln, lb, ls, lp, lmsgs = tostring(text or ""):match(
-        "^P2;([^;]*);(%d+);(%d+);(%d+);([^;]*);([^;]*);([^;]*);(%d+);(%d+);([^;]*);([^;]*);([^;]*)$")
+    local H = "(%d+);(%d+);([^;]*);([^;]*);([^;]*);([^;]*)"
+    local opts, seats, n, b, s, p, k, msgs, ln, lb, ls, lp, lk, lmsgs = tostring(text or ""):match(
+        "^P3;([^;]*);(%d+);" .. H .. ";" .. H .. "$")
     if not opts then return nil end
     local m = Engine.NewMatch(opts, salt, tonumber(seats))
     if m.seats ~= tonumber(seats) then return nil end
     n, ln = tonumber(n), tonumber(ln)
     -- the burned chips aren't kept: Chips() counts what is at the table, which is all anyone needs
-    if ln > 0 and not replay(m, ln, tonumber(lb), ls, lp, lmsgs) then return nil end
+    if ln > 0 and not replay(m, ln, tonumber(lb), ls, lp, lk, lmsgs) then return nil end
     if n > 0 then
         if m.over then return nil end -- the last hand ended the match, so there is no hand after it
         local last = m.last
-        if not replay(m, n, tonumber(b), s, p, msgs) then return nil end
+        if not replay(m, n, tonumber(b), s, p, k, msgs) then return nil end
         if m.last == nil then m.last = last end
     elseif not m.over then
         return nil
@@ -641,6 +716,7 @@ function Engine.Said(said)
     if not said then return nil end
     local k, amt = said[1], said[2]
     local a = said.allin and " (all-in)" or ""
+    if said.timeout then return k == "check" and "Check (out of time)" or "Fold (out of time)" end
     if k == "fold" then return "Fold" end
     if k == "left" then return "Left" end
     if k == "check" then return "Check" end
