@@ -409,7 +409,7 @@ do -- the shot clock and the time bank
     eq(bb, h.bbSeat, "the big blind is left with the option")
     local had = m.bank[bb]
     act(m, 0, "T" .. bb)
-    check(not h.folded[bb] and h.said[bb] and h.said[bb][1] == "check", "out of time with nothing to call checks")
+    check(not h.folded[bb] and h.street == 1, "out of time with nothing to call checks, and the flop comes")
     eq(m.bank[bb], had, "a bank that wasn't running is kept")
     check(not Engine.Apply(m, 0, "T" .. second), "only the player to act can run out of time")
     -- banks carry on to the next hand, and through a snapshot

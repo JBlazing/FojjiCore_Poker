@@ -472,7 +472,7 @@ function Engine.Legal(m)
     return L
 end
 
-local function bettingAction(m, h, seat, msg)
+local function bettingAction(m, h, seat, msg, timedOut)
     local L = Engine.Legal(m)
     if not L or L.seat ~= seat then return false, "not your turn" end
     local kind = msg:sub(1, 1)
@@ -506,6 +506,7 @@ local function bettingAction(m, h, seat, msg)
     else
         return false, "unknown action"
     end
+    if timedOut and h.said[seat] then h.said[seat].timeout = true end
     h.acted[seat] = true
     h.actedAt[seat] = h.raises
     h.last = { seat = seat, kind = kind }
@@ -569,12 +570,11 @@ local function timeOut(m, h, msg)
     local had = m.bank[s]
     if h.banking then m.bank[s] = 0 end
     local L = Engine.Legal(m)
-    local ok, err = bettingAction(m, h, s, L and L.check and "X" or "F")
+    local ok, err = bettingAction(m, h, s, L and L.check and "X" or "F", true)
     if not ok then
         m.bank[s] = had
         return false, err
     end
-    if h.said[s] then h.said[s].timeout = true end
     return true
 end
 
