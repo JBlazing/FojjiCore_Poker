@@ -3,8 +3,9 @@
 -- sitting. The rules live in Engine.lua and Eval.lua, the lobby and the messages in Table.lua; this
 -- file runs the deal handshake and draws the window.
 --
--- Nothing runs while no game is going. During a game the only timer is Table.lua's heartbeat, which
--- re-sends a lost message and asks the host to catch us up after one went missing.
+-- Nothing runs while no game is going. During a game the timers are Table.lua's heartbeat, which
+-- re-sends a lost message and asks the host to catch us up after one went missing, and its clock
+-- (the shot clock and time bank). The window redraws the clock a few times a second while it's open.
 local ADDON, ns = ...
 local Addon = FojjiCoreNS
 local Games = Addon and Addon.Games
@@ -45,6 +46,8 @@ local HELP = {
     "Pot-Limit Omaha: four cards each. Use exactly two of them with three from the board. The biggest bet is the size of the pot.",
     "The two players after the button post the blinds. Heads-up, the button posts the small blind.",
     "Lose every chip and you're out; the last player with chips wins the table.",
+    ("You have %d seconds for each decision, plus a %d-minute time bank for the whole game. With Auto time bank on, the bank starts by itself when your %d seconds run out; with it off, click Use time bank. Run out of time and you check, or fold if there's a bet."):format(
+        Engine.SHOT_CLOCK, Engine.TIME_BANK / 60, Engine.SHOT_CLOCK),
     "Each deck is shuffled from a secret of two players', so nobody can stack it.",
 }
 
@@ -58,6 +61,7 @@ local function db()
     d.stackBB = tonumber(d.stackBB) or 100
     d.level = tonumber(d.level) or 0
     d.w, d.l = tonumber(d.w) or 0, tonumber(d.l) or 0
+    if d.autoBank == nil then d.autoBank = true end
     return d
 end
 local function chosenOpts()
@@ -280,7 +284,7 @@ local function afterChange(why, text)
     end
     drive()
     if myTurn() then
-        local akey = g.id .. ":" .. m.hand.n .. ":" .. #m.hand.log
+        local akey = g.id .. ":" .. tostring(Engine.TurnKey(m))
         if alerted ~= akey and not (win and win:IsShown()) then
             alerted = akey
             FDJ.Print(("Poker: your turn (hand %d). Type /fc poker."):format(m.hand.n))
@@ -293,6 +297,7 @@ end
 -- ---------------------------------------------------------------- the table's callbacks
 PK.note = nil
 T.cb.options = chosenOpts
+T.cb.autoBank = function() return db().autoBank end
 T.cb.onChange = function(why, text)
     if why == "start" then
         local g = T.game
@@ -551,6 +556,17 @@ local function newPlate(parent)
     p.button:SetFill(0.95, 0.93, 0.86, 1)
     p.button.text:SetText("D")
     p.button.text:SetTextColor(0.1, 0.1, 0.1)
+    -- the clock of the player to act: a bar along the bottom that runs down
+    p.timer = p:CreateTexture(nil, "OVERLAY")
+    p.timer:SetPoint("BOTTOMLEFT", 2, 2)
+    p.timer:SetHeight(3)
+    p.timer:Hide()
+    function p:Timer(frac, color)
+        if not frac then self.timer:Hide() return end
+        self.timer:SetWidth(max(1, (self:GetWidth() - 4) * max(0, min(1, frac))))
+        self.timer:SetColorTexture(color[1], color[2], color[3], 0.95)
+        self.timer:Show()
+    end
     -- ring colours: green for whoever is to act, gold for a pot's winner
     function p:Ring(color)
         if not color then self.ring:Hide() return end
@@ -779,7 +795,7 @@ end
 local amount, amountKey
 local function decisionKey()
     local g = T.game
-    return g and (g.id .. ":" .. g.match.hand.n .. ":" .. #g.match.hand.log)
+    return g and (g.id .. ":" .. tostring(Engine.TurnKey(g.match)))
 end
 local function clampAmount(L, v)
     v = floor(tonumber(v) or L.minTo)
@@ -821,7 +837,7 @@ local function buildBar(f)
     -- the host can take out a player who stopped answering
     bar.remove = Kit.Button(bar, "Remove", 150, 28, function()
         local g = T.game
-        local seat = g and Engine.Expect(g.match)
+        local seat = g and bar.remove.seat
         if not (seat and seat ~= g.me and T.IsHost()) then return end
         Kit.Confirm(("Take %s out of the game? Their chips leave the table."):format(short(g.names[seat])), function()
             T.Remove(seat)
@@ -829,6 +845,20 @@ local function buildBar(f)
     end)
     bar.remove:SetPoint("LEFT", bar.giveUp, "RIGHT", 8, 0)
     bar.remove:Hide()
+
+    -- the time bank: whether it starts by itself, what's left of it, and a button to start it by hand
+    bar.auto = Kit.Check(bar, "Auto time bank", function() return db().autoBank end, function(on)
+        db().autoBank = on and true or false
+        if win and win:IsShown() then paint() end
+    end, ("When your %d seconds run out, your time bank starts by itself. Turn this off to start it yourself with Use time bank."):format(Engine.SHOT_CLOCK))
+    bar.auto:SetPoint("TOPLEFT", 12, -12)
+    bar.bank = Kit.Text(bar, 12, SOFT)
+    bar.bank:SetPoint("LEFT", bar.auto, "RIGHT", 12, 0)
+    bar.useBank = Kit.Button(bar, "Use time bank", 120, 24, function()
+        if T.UseBank() then paint() end
+    end)
+    bar.useBank:SetPoint("LEFT", bar.bank, "RIGHT", 12, 0)
+    bar.useBank:Hide()
 
     bar.raise = Kit.Button(bar, "Raise", 160, 30, function()
         local L = legal()
@@ -989,6 +1019,14 @@ local function build()
 
     Games.HeaderTools(f, { help = HELP, sound = snd })
     f:HookScript("OnShow", function() paint() end)
+    -- the clock runs down between moves
+    local since = 0
+    f:HookScript("OnUpdate", function(_, elapsed)
+        since = since + (elapsed or 0)
+        if since < 0.2 then return end
+        since = 0
+        if T.Playing() then PK.PaintClock() end
+    end)
     Games.Window(f, KEY)
     return f
 end
@@ -1061,9 +1099,64 @@ local function seatWidgets(seat)
     return win.others[p]
 end
 
+-- "18s" for the shot clock, "1:42" for a bank
+local function clockText(s, bank)
+    s = math.ceil(s)
+    if not bank then return s .. "s" end
+    return ("%d:%02d"):format(floor(s / 60), s % 60)
+end
+local RED, ORANGE = { 0.95, 0.35, 0.30 }, { 1.00, 0.62, 0.20 }
+
+-- the shot clock and time bank: on the plate of the player to act, and my own bank in the bar.
+-- Called by paint and a few times a second while the window is open.
+function PK.PaintClock()
+    local f = win
+    local g = T.game
+    if not (f and g and g.match and f.laidOut) then return end
+    local c = not g.ended and T.Clock()
+    for seat = 1, g.match.seats do
+        local s = seatWidgets(seat)
+        if not (c and c.seat == seat) then
+            s.plate:Timer(nil)
+        end
+    end
+    if c then
+        local s = seatWidgets(c.seat)
+        local p = s.plate
+        local text
+        if c.shot > 0 then
+            local low = c.shot <= 6
+            p:Timer(c.shot / Engine.SHOT_CLOCK, low and RED or GREEN)
+            text = (low and "|cffff6b5c" or "|cffb6f0c4") .. clockText(c.shot) .. "|r"
+        elseif c.armed then
+            p:Timer(c.bank / Engine.TIME_BANK, ORANGE)
+            text = "|cffffa040Bank " .. clockText(c.bank, true) .. "|r"
+        else
+            p:Timer(0, RED)
+            text = "|cffff6b5c0s|r"
+        end
+        -- the clock takes the tag's place while they think
+        p.tag:SetText(text)
+    end
+    -- my own bank
+    local bar = f.bar
+    local m = g.match
+    local mine = m.bank[g.me] or 0
+    if c and c.seat == g.me and c.armed then mine = c.bank end
+    local showBank = not T.Over(g) and not iAmOut()
+    bar.auto:SetShown(showBank)
+    bar.bank:SetShown(showBank)
+    if showBank then
+        local using = c and c.seat == g.me and c.banking
+        bar.bank:SetText((using and "|cffffa040" or "") .. "Time bank " .. clockText(mine, true) .. (using and "|r" or ""))
+    end
+    bar.useBank:SetShown(showBank and myTurn() and c ~= nil and c.seat == g.me and not c.armed and mine > 0)
+end
+
 local function shortSaid(said)
     if not said then return nil end
     local k, amt = said[1], said[2]
+    if said.timeout then return "Timed out" end
     if said.allin then return "All-in" end
     if k == "fold" then return "Fold" end
     if k == "left" then return "Left" end
@@ -1221,7 +1314,7 @@ paint = function()
             elseif r and r.showdown and live then tag = kind(r.names[seat])
             elseif won and not r.showdown then tag = "Wins " .. commas(r.won[seat])
             elseif left then tag = "Left"
-            elseif folded then tag = "Fold"
+            elseif folded then tag = (view.said[seat] and view.said[seat].timeout) and "Timed out" or "Fold"
             else tag = shortSaid(view.said[seat]) end
             if not tag and not showingLast then
                 if stacks[seat] == 0 and live then tag = "All-in"
@@ -1307,9 +1400,21 @@ paint = function()
     local L = myTurn() and legal()
     bar.giveUp:SetLabel((over or out) and "Menu" or "Leave")
     bar.giveUp:SetWidth(96)
-    -- the host's way out of a player who stopped answering
-    local stuck = not over and T.IsHost() and Engine.Expect(m)
-    if stuck and stuck ~= me and GetTime() - (g.movedAt or GetTime()) > 60 then
+    -- the host's way out of a player who stopped answering: the deal waiting on them for a minute, or
+    -- them running out of time twice in a row
+    local stuck
+    if not over and T.IsHost() then
+        local waitingOn = Engine.Expect(m)
+        if waitingOn and waitingOn ~= me and GetTime() - (g.movedAt or GetTime()) > 60 then stuck = waitingOn end
+        for seat = 1, N do
+            if not stuck and seat ~= me and not m.out[seat] and not (h.left and h.left[seat])
+                and T.Timeouts(seat) >= 2 then
+                stuck = seat
+            end
+        end
+    end
+    bar.remove.seat = stuck
+    if stuck then
         bar.remove:SetLabel("Remove " .. short(nameAt(stuck)))
         bar.remove:SetWidth(150)
         bar.remove:Show()
@@ -1374,6 +1479,7 @@ paint = function()
         end
         bar.wait:SetText(text)
     end
+    PK.PaintClock()
 
     -- the end of the game for me (after the last runout has been played out)
     if not rolling and f.resultFor ~= g.id and (m.over or out or closed) then

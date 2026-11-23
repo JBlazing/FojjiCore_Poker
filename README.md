@@ -17,6 +17,7 @@ The host opens a table and chooses the variant, the starting stack (50, 100 or 2
 - Open the games menu and pick **Poker**, or type `/fc poker` (also `/fc holdem` or `/fc plo`). `/fc poker <name>` opens a table and invites them.
 - **The lobby.** Click **Open a table**, then invite people by name, from the Party / Raid / Guild / Recent lists, or everyone in your group at once with **Invite group**. Each invited player gets a toast and a line in chat, and can join from the toast or from the Poker window. Everyone at the table sees who is sitting. The host can still change the game while waiting. **Start** lights up once a second player sits down, and seats are drawn at random when the host starts.
 - **At the table.** The button moves round the table each hand. The two players after it post the blinds, and the player after the big blind acts first. Heads-up, the button posts the small blind. Side pots are split properly when players are all-in for different amounts.
+- **The clock.** Each decision has a 24-second shot clock, shown as a bar and a countdown on the plate of whoever is to act. Everyone also has a 2-minute time bank for the whole game. With **Auto time bank** on (the default, in the action bar), the bank starts by itself when the 24 seconds run out. With it off, the bank only starts if you click **Use time bank**. Run out of time and you check, or fold if there's a bet to call. If a player runs out of time twice in a row, the host gets a **Remove** button for them.
 - **Going out.** Lose every chip and you finish in your place (5th of 6, say), and can keep watching. The last player with chips wins the table. **Leave** walks out mid-game: your hand is folded and your chips leave with you. If the host leaves, the table closes for everyone. If a player stops answering, the host gets a **Remove** button after a minute.
 - A game survives `/reload` and logging out for up to 30 minutes.
 - If the window is closed when it's your turn, a line in chat tells you, and the menu tile shows "Your turn".
@@ -37,6 +38,7 @@ Every client runs the same engine on the same moves, so they all agree. The host
 - `K` / `S` / `R`: the deal handshake. The big blind commits to a hash of a secret. The button answers with a number of its own. The big blind reveals the secret, and the deck is shuffled from both. Neither of them can steer the shuffle. If one of them leaves mid-deal, the next players along take over.
 - `F` `X` `C` `B<to>`: fold, check, call, and bet or raise to an amount.
 - `O<seat>`: sent only by the host, when a player leaves or is removed.
+- `W`: the player to act starts their time bank. `U<seat><secs>` and `T<seat>` are sent only by the host, which keeps the one clock: the seconds of bank a player used (sent just before their move), and a player running out of time.
 
 Fair, but not secret: once the secret is revealed, every client could work out every card. The addon only ever shows your own cards, plus those still in at a showdown. Someone with a modified client could peek, which is why it's play chips only.
 
